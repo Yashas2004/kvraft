@@ -67,6 +67,33 @@ func (db *DB) Delete(key []byte) error {
 	return nil
 }
 
+// WriteBatch logs all entries with one fsync, then applies them in order.
+func (db *DB) WriteBatch(entries []Entry) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	records := make([]Record, 0, len(entries))
+	for _, e := range entries {
+		recordType := recordPut
+		if e.Deleted {
+			recordType = recordDelete
+		}
+		records = append(records, Record{Type: recordType, Key: e.Key, Value: e.Value})
+	}
+
+	if err := db.wal.AppendBatch(records); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.Deleted {
+			db.mem.Delete(e.Key)
+		} else {
+			db.mem.Put(e.Key, e.Value)
+		}
+	}
+	return nil
+}
+
 // Get returns (value, found, error). A tombstone counts as not found.
 func (db *DB) Get(key []byte) ([]byte, bool, error) {
 	value, deleted, found := db.mem.Get(key)

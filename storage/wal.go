@@ -86,6 +86,24 @@ func (w *WAL) Append(r Record) error {
 	return nil
 }
 
+// AppendBatch writes many records with a single Write and a single fsync.
+func (w *WAL) AppendBatch(records []Record) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var data []byte
+	for _, r := range records {
+		data = append(data, encodeRecord(r)...)
+	}
+	if _, err := w.file.Write(data); err != nil {
+		return err
+	}
+	if w.syncEachWrite {
+		return w.file.Sync()
+	}
+	return nil
+}
+
 func readRecords(f *os.File) ([]Record, int64, error) {
 	reader := bufio.NewReader(f)
 	var records []Record
