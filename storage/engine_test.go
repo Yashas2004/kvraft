@@ -3,10 +3,12 @@ package storage
 import (
 	"bufio"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEngineRestart(t *testing.T) {
@@ -126,10 +128,11 @@ func TestEngineFlushAndShadowing(t *testing.T) {
 		db.Delete([]byte(fmt.Sprintf("key%05d", i)))
 	}
 
-	if len(db.tables) < 2 {
-		t.Fatalf("expected several SSTables, got %d", len(db.tables))
+	stats := db.Stats()
+	if stats.Flushes < 2 {
+		t.Fatalf("expected several flushes, got %d", stats.Flushes)
 	}
-	t.Logf("flushed into %d SSTables", len(db.tables))
+	t.Logf("%d flushes, %d compactions", stats.Flushes, stats.Compactions)
 
 	check := func(db *DB) {
 		for i := 0; i < n; i++ {
@@ -163,4 +166,145 @@ func TestEngineFlushAndShadowing(t *testing.T) {
 	}
 	defer db2.Close()
 	check(db2)
+}
+
+func TestObsoleteFiles(t *testing.T) {
+	// Scenario: L0 #1 and #2 plus old L1 #0 were compacted into L1 #3,
+	// crash before deleting inputs. Then L0 #4 was flushed. L2 #2 is older, deeper data.
+	files := []fileID{
+		{level: 1, num: 0},
+		{level: 0, num: 1},
+		{level: 0, num: 2},
+		{level: 2, num: 2},
+		{level: 1, num: 3},
+		{level: 0, num: 4},
+	}
+	obsolete := obsoleteFiles(files)
+
+	expectObsolete := []fileID{{1, 0}, {0, 1}, {0, 2}}
+	expectKept := []fileID{{2, 2}, {1, 3}, {0, 4}}
+	for _, f := range expectObsolete {
+		if !obsolete[f] {
+			t.Fatalf("L%d #%d should be obsolete", f.level, f.num)
+		}
+	}
+	for _, f := range expectKept {
+		if obsolete[f] {
+			t.Fatalf("L%d #%d should be kept", f.level, f.num)
+		}
+	}
+}
+
+func TestEngineCompaction(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{MemtableSizeLimit: 1024, L0CompactionTrigger: 4, LevelSizeRatio: 4}
+
+	db, err := OpenDBWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n := 3000
+	for i := 0; i < n; i++ {
+		db.Put([]byte(fmt.Sprintf("key%05d", i)), []byte(fmt.Sprintf("value%d", i)))
+	}
+	for i := 0; i < n; i += 3 {
+		db.Put([]byte(fmt.Sprintf("key%05d", i)), []byte(fmt.Sprintf("new%d", i)))
+	}
+	for i := 0; i < n; i += 4 {
+		db.Delete([]byte(fmt.Sprintf("key%05d", i)))
+	}
+
+	stats := db.Stats()
+	if stats.Compactions == 0 {
+		t.Fatalf("expected compactions to run")
+	}
+	if len(db.l0) >= opts.L0CompactionTrigger {
+		t.Fatalf("L0 has %d tables, compaction should have kept it below %d", len(db.l0), opts.L0CompactionTrigger)
+	}
+	deepest := 0
+	for level := 1; level < numLevels; level++ {
+		if db.levels[level] != nil {
+			deepest = level
+			t.Logf("L%d: %d bytes (limit %d)", level, db.levels[level].size, db.levelLimit(level))
+		}
+	}
+	if deepest < 2 {
+		t.Fatalf("expected data to cascade to L2 or deeper, deepest is L%d", deepest)
+	}
+	t.Logf("%d flushes, %d compactions, L0 tables: %d", stats.Flushes, stats.Compactions, len(db.l0))
+
+	check := func(db *DB) {
+		for i := 0; i < n; i++ {
+			key := []byte(fmt.Sprintf("key%05d", i))
+			value, found, err := db.Get(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if i%4 == 0 {
+				if found {
+					t.Fatalf("%s was deleted but found %q", key, value)
+				}
+			} else if i%3 == 0 {
+				if !found || string(value) != fmt.Sprintf("new%d", i) {
+					t.Fatalf("%s: expected new%d, got %q", key, i, value)
+				}
+			} else {
+				if !found || string(value) != fmt.Sprintf("value%d", i) {
+					t.Fatalf("%s: expected value%d, got %q", key, i, value)
+				}
+			}
+		}
+	}
+
+	check(db)
+	db.Close()
+
+	db2, err := OpenDBWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	check(db2)
+}
+
+func TestReportAmplification(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow measurement")
+	}
+
+	uniqueKeys := 10000
+	writes := 200000
+	value := make([]byte, 100)
+	liveBytes := int64(uniqueKeys * (11 + len(value))) // "key%08d" is 11 bytes
+
+	for _, disable := range []bool{true, false} {
+		db, err := OpenDBWithOptions(t.TempDir(), Options{MemtableSizeLimit: 256 * 1024, DisableCompaction: disable})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for i := 0; i < writes; i++ {
+			key := []byte(fmt.Sprintf("key%08d", rand.Intn(uniqueKeys)))
+			if err := db.Put(key, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		lookups := 10000
+		start := time.Now()
+		for i := 0; i < lookups; i++ {
+			db.Get([]byte(fmt.Sprintf("key%08d", uniqueKeys+i))) // never written
+		}
+		absentLatency := time.Since(start) / time.Duration(lookups)
+
+		stats := db.Stats()
+		lsmWA := float64(stats.FlushBytes+stats.CompactionBytes) / float64(stats.UserBytes)
+		spaceAmp := float64(db.TableBytes()) / float64(liveBytes)
+
+		t.Logf("compaction=%-5v flushes=%d compactions=%d L0 tables=%d", !disable, stats.Flushes, stats.Compactions, len(db.l0))
+		t.Logf("   write amp: total %.2f (SSTables only %.2f)  space amp: %.2f  absent Get: %v",
+			stats.WriteAmplification(), lsmWA, spaceAmp, absentLatency)
+		db.Close()
+	}
 }
