@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
 	"os"
 )
 
@@ -237,4 +238,44 @@ func (s *SSTable) lookup(key []byte) ([]byte, bool, bool, error) {
 
 func (s *SSTable) Close() error {
 	return s.file.Close()
+}
+
+// sstIterator streams entries in key order from an SSTable's data section.
+type sstIterator struct {
+	reader  *bufio.Reader
+	current Entry
+	err     error
+}
+
+func (s *SSTable) newIterator() *sstIterator {
+	section := io.NewSectionReader(s.file, 0, int64(s.dataEnd))
+	return &sstIterator{reader: bufio.NewReader(section)}
+}
+
+// Next advances to the next entry. Returns false at the end or on error (check it.err).
+func (it *sstIterator) Next() bool {
+	header := make([]byte, entryHeaderSize)
+	_, err := io.ReadFull(it.reader, header)
+	if err == io.EOF {
+		return false // clean end of data section
+	}
+	if err != nil {
+		it.err = err
+		return false
+	}
+
+	keyLen := int(binary.LittleEndian.Uint32(header[0:4]))
+	valLen := int(binary.LittleEndian.Uint32(header[4:8]))
+	body := make([]byte, keyLen+valLen)
+	if _, err := io.ReadFull(it.reader, body); err != nil {
+		it.err = err
+		return false
+	}
+
+	it.current = Entry{
+		Key:     body[:keyLen],
+		Value:   body[keyLen:],
+		Deleted: header[8] == recordDelete,
+	}
+	return true
 }
