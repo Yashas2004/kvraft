@@ -105,3 +105,62 @@ func runCrashChild() {
 		fmt.Println("ACK " + key) // only printed after the write is durable
 	}
 }
+
+func TestEngineFlushAndShadowing(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{SyncEachWrite: false, MemtableSizeLimit: 1024}
+
+	db, err := OpenDBWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	n := 2000
+	for i := 0; i < n; i++ {
+		db.Put([]byte(fmt.Sprintf("key%05d", i)), []byte(fmt.Sprintf("value%d", i)))
+	}
+	for i := 0; i < n; i += 5 {
+		db.Put([]byte(fmt.Sprintf("key%05d", i)), []byte(fmt.Sprintf("new%d", i)))
+	}
+	for i := 0; i < n; i += 7 {
+		db.Delete([]byte(fmt.Sprintf("key%05d", i)))
+	}
+
+	if len(db.tables) < 2 {
+		t.Fatalf("expected several SSTables, got %d", len(db.tables))
+	}
+	t.Logf("flushed into %d SSTables", len(db.tables))
+
+	check := func(db *DB) {
+		for i := 0; i < n; i++ {
+			key := []byte(fmt.Sprintf("key%05d", i))
+			value, found, err := db.Get(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if i%7 == 0 {
+				if found {
+					t.Fatalf("%s was deleted but found %q", key, value)
+				}
+			} else if i%5 == 0 {
+				if !found || string(value) != fmt.Sprintf("new%d", i) {
+					t.Fatalf("%s: expected new%d, got %q", key, i, value)
+				}
+			} else {
+				if !found || string(value) != fmt.Sprintf("value%d", i) {
+					t.Fatalf("%s: expected value%d, got %q", key, i, value)
+				}
+			}
+		}
+	}
+
+	check(db)
+	db.Close()
+
+	db2, err := OpenDBWithOptions(dir, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	check(db2)
+}
