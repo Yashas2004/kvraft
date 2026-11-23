@@ -54,3 +54,30 @@ func BenchmarkPutNoFsync(b *testing.B)        { benchmarkPut(b, false) }
 func BenchmarkBatch10(b *testing.B)           { benchmarkBatch(b, 10) }
 func BenchmarkBatch100(b *testing.B)          { benchmarkBatch(b, 100) }
 func BenchmarkBatch1000(b *testing.B)         { benchmarkBatch(b, 1000) }
+
+func BenchmarkSSTableGetPresent(b *testing.B) {
+	n := 100000
+	table := buildTestSSTable(b, n)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		table.Get([]byte(fmt.Sprintf("key%08d", 2*(i%n))))
+	}
+}
+
+func BenchmarkSSTableGetAbsentWithBloom(b *testing.B) {
+	n := 100000
+	table := buildTestSSTable(b, n)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		table.Get([]byte(fmt.Sprintf("key%08d", 2*(i%n)+1)))
+	}
+}
+
+func BenchmarkSSTableGetAbsentNoBloom(b *testing.B) {
+	n := 100000
+	table := buildTestSSTable(b, n)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		table.lookup([]byte(fmt.Sprintf("key%08d", 2*(i%n)+1)))
+	}
+}
