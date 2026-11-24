@@ -105,13 +105,15 @@ func (c *cluster) isConnected(id int) bool {
 	return c.net.connected[id]
 }
 
-// checkOneLeader waits for a leader among connected nodes and fails if any
-// term ever has two leaders. Returns the leader of the latest term.
+// checkOneLeader waits until exactly one connected node believes it is leader
+// (stale leaders from older terms must have stepped down). Two leaders in the
+// SAME term is a safety violation and fails immediately.
 func (c *cluster) checkOneLeader() int {
 	for attempt := 0; attempt < 20; attempt++ {
 		time.Sleep(50 * time.Millisecond)
 
 		leadersByTerm := make(map[int][]int)
+		totalLeaders := 0
 		for i := 0; i < c.n; i++ {
 			if !c.isConnected(i) {
 				continue
@@ -119,23 +121,23 @@ func (c *cluster) checkOneLeader() int {
 			term, isLeader := c.net.node(i).GetState()
 			if isLeader {
 				leadersByTerm[term] = append(leadersByTerm[term], i)
+				totalLeaders++
 			}
 		}
 
-		latestTerm := -1
 		for term, ids := range leadersByTerm {
 			if len(ids) > 1 {
 				c.t.Fatalf("term %d has %d leaders: %v", term, len(ids), ids)
 			}
-			if term > latestTerm {
-				latestTerm = term
+		}
+		if totalLeaders == 1 {
+			for _, ids := range leadersByTerm {
+				return ids[0]
 			}
 		}
-		if latestTerm != -1 {
-			return leadersByTerm[latestTerm][0]
-		}
+		// zero leaders (election in progress) or a stale leader hasn't stepped down yet: wait
 	}
-	c.t.Fatalf("no leader elected")
+	c.t.Fatalf("expected exactly one leader")
 	return -1
 }
 
