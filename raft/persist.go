@@ -3,6 +3,7 @@ package raft
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"hash/crc32"
 	"io"
 	"os"
@@ -18,10 +19,21 @@ const (
 	maxCommandSize  = 64 * 1024 * 1024
 )
 
-// Persister stores Raft's persistent state (Figure 2):
+// PersistedState is everything Raft needs to restart.
+type PersistedState struct {
+	Term          int
+	VotedFor      int
+	SnapshotIndex int // last log index covered by the snapshot (0 = none)
+	SnapshotTerm  int
+	Snapshot      []byte
+	Log           []LogEntry // Log[0] is a placeholder holding SnapshotTerm
+}
+
+// Persister stores Raft's persistent state:
 //
-//	raft-state: currentTerm + votedFor, replaced atomically (shadow copy + rename)
-//	raft-log:   append-only, CRC-checked records; truncation is itself a record
+//	raft-state:    currentTerm + votedFor (shadow copy + atomic rename)
+//	raft-log:      append-only CRC-checked records; truncation is a record
+//	raft-snapshot: index, term and the service's snapshot bytes (atomic rename)
 type Persister struct {
 	mu      sync.Mutex
 	dir     string
@@ -33,15 +45,43 @@ func OpenPersister(dir string) (*Persister, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "raft-log"), os.O_CREATE|os.O_RDWR, 0644)
+	p := &Persister{dir: dir}
+	f, err := os.OpenFile(p.logPath(), os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return nil, err
 	}
-	return &Persister{dir: dir, logFile: f}, nil
+	p.logFile = f
+	return p, nil
 }
 
-func (p *Persister) statePath() string {
-	return filepath.Join(p.dir, "raft-state")
+func (p *Persister) statePath() string    { return filepath.Join(p.dir, "raft-state") }
+func (p *Persister) logPath() string      { return filepath.Join(p.dir, "raft-log") }
+func (p *Persister) snapshotPath() string { return filepath.Join(p.dir, "raft-snapshot") }
+
+// writeSynced writes data to path and fsyncs it.
+func writeSynced(path string, data []byte) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// writeFileAtomic: the file at path is either the old version or the new one, never half.
+func writeFileAtomic(path string, data []byte) error {
+	tmpPath := path + ".tmp"
+	if err := writeSynced(tmpPath, data); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func encodeLogRecord(recType byte, index, term int, command []byte) []byte {
@@ -55,23 +95,42 @@ func encodeLogRecord(recType byte, index, term int, command []byte) []byte {
 	return buf
 }
 
-// LoadState returns (currentTerm, votedFor, log). The log includes the dummy entry at index 0.
-func (p *Persister) LoadState() (int, int, []LogEntry, error) {
+func (p *Persister) LoadState() (PersistedState, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	term, votedFor := 0, -1
+	state := PersistedState{VotedFor: -1}
+
 	data, err := os.ReadFile(p.statePath())
 	if err == nil && len(data) == 16 {
-		term = int(binary.LittleEndian.Uint64(data[0:8]))
-		votedFor = int(int64(binary.LittleEndian.Uint64(data[8:16])))
+		state.Term = int(binary.LittleEndian.Uint64(data[0:8]))
+		state.VotedFor = int(int64(binary.LittleEndian.Uint64(data[8:16])))
 	} else if err != nil && !os.IsNotExist(err) {
-		return 0, 0, nil, err
+		return state, err
 	}
 
-	log := []LogEntry{{Term: 0}}
+	// Snapshot file: crc(4) | index(8) | term(8) | data
+	snapData, err := os.ReadFile(p.snapshotPath())
+	if err == nil {
+		if len(snapData) < 20 {
+			return state, errors.New("raft: snapshot file too short")
+		}
+		if crc32.ChecksumIEEE(snapData[4:]) != binary.LittleEndian.Uint32(snapData[0:4]) {
+			return state, errors.New("raft: snapshot checksum mismatch")
+		}
+		state.SnapshotIndex = int(binary.LittleEndian.Uint64(snapData[4:12]))
+		state.SnapshotTerm = int(binary.LittleEndian.Uint64(snapData[12:20]))
+		state.Snapshot = make([]byte, len(snapData)-20)
+		copy(state.Snapshot, snapData[20:])
+	} else if !os.IsNotExist(err) {
+		return state, err
+	}
+
+	base := state.SnapshotIndex
+	log := []LogEntry{{Term: state.SnapshotTerm}}
+
 	if _, err := p.logFile.Seek(0, io.SeekStart); err != nil {
-		return 0, 0, nil, err
+		return state, err
 	}
 	reader := bufio.NewReader(p.logFile)
 	header := make([]byte, logRecordHeader)
@@ -80,10 +139,10 @@ func (p *Persister) LoadState() (int, int, []LogEntry, error) {
 	for {
 		_, err := io.ReadFull(reader, header)
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break // clean end or torn header
+			break
 		}
 		if err != nil {
-			return 0, 0, nil, err
+			return state, err
 		}
 
 		storedCRC := binary.LittleEndian.Uint32(header[0:4])
@@ -94,74 +153,57 @@ func (p *Persister) LoadState() (int, int, []LogEntry, error) {
 		if cmdLen > maxCommandSize {
 			break
 		}
-
 		command := make([]byte, cmdLen)
 		if _, err := io.ReadFull(reader, command); err != nil {
-			break // torn body
+			break
 		}
 		hasher := crc32.NewIEEE()
 		hasher.Write(header[4:])
 		hasher.Write(command)
 		if hasher.Sum32() != storedCRC {
-			break // torn or corrupt record
+			break
 		}
 
 		if recType == recTruncate {
-			if index >= 1 && index < len(log) {
-				log = log[:index] // drop index and everything after
+			if index <= base {
+				log = log[:1] // drops everything after the snapshot
+			} else if index-base < len(log) {
+				log = log[:index-base]
 			}
 		} else if recType == recEntry {
-			if index != len(log) {
-				break // entries must be contiguous
+			if index <= base {
+				// Covered by the snapshot (crash between snapshot save and log rewrite).
+			} else if index == base+len(log) {
+				log = append(log, LogEntry{Term: entryTerm, Command: command})
+			} else {
+				break // gap: corrupt
 			}
-			log = append(log, LogEntry{Term: entryTerm, Command: command})
 		}
 		validSize += int64(logRecordHeader + cmdLen)
 	}
 
-	// Cut off any torn tail and continue appending after the last good record.
 	if err := p.logFile.Truncate(validSize); err != nil {
-		return 0, 0, nil, err
+		return state, err
 	}
 	if _, err := p.logFile.Seek(validSize, io.SeekStart); err != nil {
-		return 0, 0, nil, err
+		return state, err
 	}
-	return term, votedFor, log, nil
+	state.Log = log
+	return state, nil
 }
 
-// SaveTermVote replaces raft-state atomically: write a temp file, fsync, rename.
 func (p *Persister) SaveTermVote(term, votedFor int) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
-		return nil // node has "crashed"; writes after that are lost, like a power cut
+		return nil
 	}
-
 	buf := make([]byte, 16)
 	binary.LittleEndian.PutUint64(buf[0:8], uint64(term))
 	binary.LittleEndian.PutUint64(buf[8:16], uint64(int64(votedFor)))
-
-	tmpPath := p.statePath() + ".tmp"
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		return err
-	}
-	if _, err := f.Write(buf); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, p.statePath())
+	return writeFileAtomic(p.statePath(), buf)
 }
 
-// AppendLog durably records entries starting at fromIndex. If truncate is true,
-// everything at fromIndex and after is discarded first. One fsync per call.
 func (p *Persister) AppendLog(fromIndex int, entries []LogEntry, truncate bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -184,6 +226,52 @@ func (p *Persister) appendLocked(fromIndex int, entries []LogEntry, truncate boo
 		return err
 	}
 	return p.logFile.Sync()
+}
+
+// SaveSnapshot stores the snapshot, then rewrites raft-log to hold only the
+// entries after it. Order matters: a crash between the two steps leaves a new
+// snapshot plus the old log, and LoadState skips records the snapshot covers.
+func (p *Persister) SaveSnapshot(index, term int, data []byte, entries []LogEntry) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil
+	}
+
+	snap := make([]byte, 20+len(data))
+	binary.LittleEndian.PutUint64(snap[4:12], uint64(index))
+	binary.LittleEndian.PutUint64(snap[12:20], uint64(term))
+	copy(snap[20:], data)
+	binary.LittleEndian.PutUint32(snap[0:4], crc32.ChecksumIEEE(snap[4:]))
+	if err := writeFileAtomic(p.snapshotPath(), snap); err != nil {
+		return err
+	}
+
+	var logBuf []byte
+	for i, e := range entries {
+		logBuf = append(logBuf, encodeLogRecord(recEntry, index+1+i, e.Term, e.Command)...)
+	}
+	tmpPath := p.logPath() + ".tmp"
+	if err := writeSynced(tmpPath, logBuf); err != nil {
+		return err
+	}
+	// Windows can't rename over an open file: close, swap, reopen.
+	if err := p.logFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, p.logPath()); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(p.logPath(), os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		f.Close()
+		return err
+	}
+	p.logFile = f
+	return nil
 }
 
 func (p *Persister) Close() error {

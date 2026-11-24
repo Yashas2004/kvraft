@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -54,33 +55,48 @@ func (lt *localTransport) AppendEntries(peer int, args AppendEntriesArgs, reply 
 	return lt.net.reachable(lt.from, peer)
 }
 
+func (lt *localTransport) InstallSnapshot(peer int, args InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	if !lt.net.reachable(lt.from, peer) {
+		return false
+	}
+	time.Sleep(time.Duration(rand.Intn(3)) * time.Millisecond)
+	lt.net.node(peer).HandleInstallSnapshot(args, reply)
+	return lt.net.reachable(lt.from, peer)
+}
+
 // ---------- cluster helpers ----------
 
 type cluster struct {
-	t          *testing.T
-	net        *network
-	n          int
-	mu         sync.Mutex
-	logs       [][]string // logs[i] = commands applied by node i's current incarnation
-	generation []int      // bumped on every restart; old incarnations' applies are ignored
-	persisters []*Persister
-	dirs       []string
-	finished   bool
+	t             *testing.T
+	net           *network
+	n             int
+	mu            sync.Mutex
+	logs          [][]string // logs[i] = commands applied by node i's current incarnation
+	generation    []int      // bumped on every restart; old incarnations' applies are ignored
+	persisters    []*Persister
+	dirs          []string
+	snapshotEvery int // > 0: test state machine snapshots every N applied entries
+	finished      bool
 }
 
 func newCluster(t *testing.T, n int) *cluster {
+	return newClusterOpts(t, n, 0)
+}
+
+func newClusterOpts(t *testing.T, n, snapshotEvery int) *cluster {
 	net := &network{nodes: make([]*Raft, n), connected: make([]bool, n)}
 	for i := 0; i < n; i++ {
 		net.connected[i] = true
 	}
 	c := &cluster{
-		t:          t,
-		net:        net,
-		n:          n,
-		logs:       make([][]string, n),
-		generation: make([]int, n),
-		persisters: make([]*Persister, n),
-		dirs:       make([]string, n),
+		t:             t,
+		net:           net,
+		n:             n,
+		logs:          make([][]string, n),
+		generation:    make([]int, n),
+		persisters:    make([]*Persister, n),
+		dirs:          make([]string, n),
+		snapshotEvery: snapshotEvery,
 	}
 	for i := 0; i < n; i++ {
 		c.dirs[i] = t.TempDir()
@@ -109,13 +125,13 @@ func (c *cluster) start(i int) {
 	c.mu.Lock()
 	c.generation[i]++
 	gen := c.generation[i]
-	c.logs[i] = nil // a restarted node re-applies its log from index 1
+	c.logs[i] = nil // a restarted node rebuilds from its snapshot + log
 	c.persisters[i] = persister
 	c.mu.Unlock()
 
 	applyCh := make(chan ApplyMsg)
-	go c.applyLoop(i, gen, applyCh)
 	rf := NewRaft(i, c.n, &localTransport{net: c.net, from: i}, applyCh, persister)
+	go c.applyLoop(i, gen, rf, applyCh) // applier blocks on the channel until this starts
 
 	c.net.mu.Lock()
 	c.net.nodes[i] = rf
@@ -325,23 +341,57 @@ func TestRejoinDoesNotDisrupt(t *testing.T) {
 
 // ---------- replication helpers ----------
 
-func (c *cluster) applyLoop(i, gen int, applyCh chan ApplyMsg) {
+func encodeCommands(commands []string) []byte {
+	return []byte(strings.Join(commands, "\x00"))
+}
+
+func decodeCommands(data []byte) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	return strings.Split(string(data), "\x00")
+}
+
+func (c *cluster) applyLoop(i, gen int, rf *Raft, applyCh chan ApplyMsg) {
 	for msg := range applyCh {
-		c.recordApply(i, gen, msg)
+		snapIndex, snapData := c.recordApply(i, gen, msg)
+		if snapIndex > 0 {
+			rf.Snapshot(snapIndex, snapData) // outside c.mu
+		}
 	}
 }
 
-func (c *cluster) recordApply(i, gen int, msg ApplyMsg) {
+// recordApply checks and records one ApplyMsg. The test "state machine" is the
+// list of applied commands. Returns (index, data) when it wants a snapshot taken.
+func (c *cluster) recordApply(i, gen int, msg ApplyMsg) (int, []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.finished || gen != c.generation[i] {
-		return // test over, or message from a crashed incarnation
+		return 0, nil // test over, or message from a crashed incarnation
+	}
+
+	if msg.SnapshotValid {
+		commands := decodeCommands(msg.Snapshot)
+		if len(commands) != msg.SnapshotIndex {
+			c.t.Errorf("node %d: snapshot at %d holds %d commands", i, msg.SnapshotIndex, len(commands))
+			return 0, nil
+		}
+		for index := 1; index <= len(commands); index++ {
+			for j := 0; j < c.n; j++ {
+				if j != i && len(c.logs[j]) >= index && c.logs[j][index-1] != commands[index-1] {
+					c.t.Errorf("snapshot index %d: node %d has %q but node %d applied %q",
+						index, i, commands[index-1], j, c.logs[j][index-1])
+				}
+			}
+		}
+		c.logs[i] = commands
+		return 0, nil
 	}
 
 	expected := len(c.logs[i]) + 1
 	if msg.Index != expected {
 		c.t.Errorf("node %d applied index %d, expected %d (out of order)", i, msg.Index, expected)
-		return
+		return 0, nil
 	}
 	command := string(msg.Command)
 	for j := 0; j < c.n; j++ {
@@ -351,6 +401,11 @@ func (c *cluster) recordApply(i, gen int, msg ApplyMsg) {
 		}
 	}
 	c.logs[i] = append(c.logs[i], command)
+
+	if c.snapshotEvery > 0 && msg.Index%c.snapshotEvery == 0 {
+		return msg.Index, encodeCommands(c.logs[i])
+	}
+	return 0, nil
 }
 
 // nCommitted returns how many nodes applied an entry at index, and what it was.
@@ -481,8 +536,12 @@ func TestPersisterFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	p.SaveTermVote(5, 2)
-	p.AppendLog(1, []LogEntry{{1, []byte("a")}, {1, []byte("b")}, {2, []byte("c")}}, false)
-	p.AppendLog(2, []LogEntry{{3, []byte("x")}}, true) // replace b, c with x
+	p.AppendLog(1, []LogEntry{
+		{Term: 1, Command: []byte("a")},
+		{Term: 1, Command: []byte("b")},
+		{Term: 2, Command: []byte("c")},
+	}, false)
+	p.AppendLog(2, []LogEntry{{Term: 3, Command: []byte("x")}}, true) // replace b, c with x
 	p.Close()
 
 	// Simulate a crash mid-write: garbage at the end of the log file.
@@ -498,15 +557,15 @@ func TestPersisterFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p2.Close()
-	term, votedFor, log, err := p2.LoadState()
+	st, err := p2.LoadState()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if term != 5 || votedFor != 2 {
-		t.Fatalf("term/vote: got %d/%d, expected 5/2", term, votedFor)
+	if st.Term != 5 || st.VotedFor != 2 {
+		t.Fatalf("term/vote: got %d/%d, expected 5/2", st.Term, st.VotedFor)
 	}
-	if len(log) != 3 || string(log[1].Command) != "a" || string(log[2].Command) != "x" || log[2].Term != 3 {
-		t.Fatalf("log wrong after truncate + torn tail: %+v", log)
+	if len(st.Log) != 3 || string(st.Log[1].Command) != "a" || string(st.Log[2].Command) != "x" || st.Log[2].Term != 3 {
+		t.Fatalf("log wrong after truncate + torn tail: %+v", st.Log)
 	}
 }
 
@@ -547,10 +606,13 @@ func TestCrashLeaderAndRestart(t *testing.T) {
 	}
 }
 
+func TestPersistChurn(t *testing.T)  { runChurn(t, 0) }
+func TestSnapshotChurn(t *testing.T) { runChurn(t, 5) }
+
 // Random crashes and restarts while commands are proposed. The apply checker
 // fails the test if any two nodes ever apply different commands at one index.
-func TestPersistChurn(t *testing.T) {
-	c := newCluster(t, 5)
+func runChurn(t *testing.T, snapshotEvery int) {
+	c := newClusterOpts(t, 5, snapshotEvery)
 	c.one("init", 5)
 	alive := []bool{true, true, true, true, true}
 
@@ -584,4 +646,63 @@ func TestPersistChurn(t *testing.T) {
 		}
 	}
 	c.one("final", 5)
+}
+
+// ---------- snapshot tests ----------
+
+// A follower misses so much that the leader has compacted the entries it
+// needs: it can only catch up through InstallSnapshot.
+func TestSnapshotLaggingFollower(t *testing.T) {
+	c := newClusterOpts(t, 3, 10)
+	c.one("first", 3)
+
+	leader := c.checkOneLeader()
+	follower := (leader + 1) % 3
+	c.disconnect(follower)
+
+	for i := 0; i < 50; i++ {
+		c.one(fmt.Sprintf("cmd-%d", i), 2)
+	}
+	leader = c.checkOneLeader()
+	if length := c.net.node(leader).LogLength(); length >= 20 {
+		t.Fatalf("leader log not compacted: %d entries kept", length)
+	}
+
+	c.connect(follower)
+	last := c.one("final", 3)
+	for index := 1; index <= last; index++ {
+		if count, _ := c.nCommitted(index); count != 3 {
+			t.Fatalf("index %d on %d nodes after snapshot catch-up", index, count)
+		}
+	}
+}
+
+// Restart from snapshot + log tail; the log stays short instead of holding all history.
+func TestSnapshotRestart(t *testing.T) {
+	c := newClusterOpts(t, 3, 10)
+	for i := 1; i <= 35; i++ {
+		c.one(fmt.Sprintf("cmd-%d", i), 3)
+	}
+
+	for i := 0; i < 3; i++ {
+		c.crash(i)
+	}
+	for i := 0; i < 3; i++ {
+		c.restart(i)
+	}
+
+	index := c.one("after", 3)
+	if index != 36 {
+		t.Fatalf("expected index 36 after restart, got %d", index)
+	}
+	for i := 1; i <= 36; i++ {
+		if count, _ := c.nCommitted(i); count != 3 {
+			t.Fatalf("index %d on %d nodes after restart", i, count)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if length := c.net.node(i).LogLength(); length >= 20 {
+			t.Fatalf("node %d kept %d log entries; snapshot should bound it", i, length)
+		}
+	}
 }

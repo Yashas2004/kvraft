@@ -70,6 +70,10 @@ func (s *Server) IsLeader() bool {
 
 func (s *Server) applyLoop(applyCh <-chan raft.ApplyMsg) {
 	for msg := range applyCh {
+		if msg.SnapshotValid {
+			continue // B2: restore the storage engine from the snapshot
+		}
+
 		op, key, value := decodeCommand(msg.Command)
 
 		r := result{term: msg.Term}

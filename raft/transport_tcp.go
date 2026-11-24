@@ -33,6 +33,14 @@ func (s *RaftService) AppendEntries(args AppendEntriesArgs, reply *AppendEntries
 	return nil
 }
 
+func (s *RaftService) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	if s.rf.killed() {
+		return errStopped
+	}
+	s.rf.HandleInstallSnapshot(args, reply)
+	return nil
+}
+
 // Serve accepts RPC connections on ln in the background.
 // Each connection gets its own goroutine; Accept returns once ln is closed.
 func Serve(rf *Raft, ln net.Listener) error {
@@ -121,4 +129,8 @@ func (t *TCPTransport) RequestVote(peer int, args RequestVoteArgs, reply *Reques
 
 func (t *TCPTransport) AppendEntries(peer int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	return t.call(peer, "Raft.AppendEntries", args, reply)
+}
+
+func (t *TCPTransport) InstallSnapshot(peer int, args InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	return t.call(peer, "Raft.InstallSnapshot", args, reply)
 }
