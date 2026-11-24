@@ -32,6 +32,8 @@ const (
 	electionTimeoutMin = 150 * time.Millisecond
 	electionTimeoutMax = 300 * time.Millisecond
 	tickInterval       = 10 * time.Millisecond
+
+	logCompactBytes = 256 * 1024 // compact raft-log on disk once it grows past this
 )
 
 type LogEntry struct {
@@ -39,8 +41,6 @@ type LogEntry struct {
 	Command []byte
 }
 
-// ApplyMsg carries either one committed entry, or (SnapshotValid) a snapshot
-// that replaces the state machine's state up to SnapshotIndex. Delivered in order.
 type ApplyMsg struct {
 	Index   int
 	Term    int
@@ -99,7 +99,7 @@ type Transport interface {
 }
 
 type Raft struct {
-	mu        sync.Mutex // lock order: rf.mu before persister.mu, everywhere
+	mu        sync.Mutex // lock order: rf.mu before persister locks, everywhere
 	id        int
 	peerCount int
 	transport Transport
@@ -109,15 +109,20 @@ type Raft struct {
 	applyCond *sync.Cond
 	syncCond  *sync.Cond
 
-	// Persistent state
 	currentTerm int
 	votedFor    int
-	log         []LogEntry // log[0] is a placeholder: its Term is the snapshot's last term
+	log         []LogEntry // log[0] placeholder: its Term is the snapshot's last term
 
-	// Snapshot / compaction. Global index i lives at log[i - lastIncludedIndex].
 	lastIncludedIndex int
 	snapshot          []byte
 	snapshotPending   bool // snapshot must be delivered to the service before more entries
+
+	// Snapshot handed to the background saver (written to disk outside rf.mu).
+	pendingSaveIndex int
+	pendingSaveTerm  int
+	pendingSaveData  []byte
+	snapshotCh       chan struct{}
+	saverDone        chan struct{} // closed when snapshotSaver exits
 
 	persistedIndex int
 
@@ -138,16 +143,17 @@ type Raft struct {
 
 func NewRaft(id, peerCount int, transport Transport, applyCh chan<- ApplyMsg, persister *Persister) *Raft {
 	rf := &Raft{
-		id:        id,
-		peerCount: peerCount,
-		transport: transport,
-		persister: persister,
-		applyCh:   applyCh,
-		votedFor:  -1,
-		log:       []LogEntry{{Term: 0}},
-		inFlight:  make([]bool, peerCount),
-		pending:   make([]bool, peerCount),
-		state:     Follower,
+		id:         id,
+		peerCount:  peerCount,
+		transport:  transport,
+		persister:  persister,
+		applyCh:    applyCh,
+		votedFor:   -1,
+		log:        []LogEntry{{Term: 0}},
+		inFlight:   make([]bool, peerCount),
+		pending:    make([]bool, peerCount),
+		snapshotCh: make(chan struct{}, 1),
+		state:      Follower,
 	}
 	if persister != nil {
 		st, err := persister.LoadState()
@@ -160,8 +166,8 @@ func NewRaft(id, peerCount int, transport Transport, applyCh chan<- ApplyMsg, pe
 		rf.lastIncludedIndex = st.SnapshotIndex
 		rf.snapshot = st.Snapshot
 		if st.SnapshotIndex > 0 {
-			rf.commitIndex = st.SnapshotIndex // a snapshot only ever covers committed entries
-			rf.snapshotPending = true         // hand it to the service before replaying entries
+			rf.commitIndex = st.SnapshotIndex
+			rf.snapshotPending = true
 		}
 	}
 	rf.persistedIndex = rf.lastIndex()
@@ -172,6 +178,8 @@ func NewRaft(id, peerCount int, transport Transport, applyCh chan<- ApplyMsg, pe
 	go rf.applier()
 	if persister != nil {
 		go rf.leaderSyncer()
+		rf.saverDone = make(chan struct{})
+		go rf.snapshotSaver()
 	}
 	return rf
 }
@@ -191,7 +199,6 @@ func (rf *Raft) termAt(index int) int {
 	return rf.log[index-rf.lastIncludedIndex].Term
 }
 
-// entriesFrom returns the log from global index onward (shares memory: copy before unlocking).
 func (rf *Raft) entriesFrom(index int) []LogEntry {
 	return rf.log[index-rf.lastIncludedIndex:]
 }
@@ -221,14 +228,15 @@ func (rf *Raft) persistLog(fromIndex int, truncate bool) {
 	rf.persistedIndex = rf.lastIndex()
 }
 
-func (rf *Raft) persistSnapshot() {
+// persistSnapshotSync: snapshot + full log rewrite, before replying (InstallSnapshot only).
+func (rf *Raft) persistSnapshotSync() {
 	if rf.persister != nil {
 		err := rf.persister.SaveSnapshot(rf.lastIncludedIndex, rf.log[0].Term, rf.snapshot, rf.log[1:])
 		if err != nil {
 			panic(fmt.Sprintf("raft %d: persist snapshot: %v", rf.id, err))
 		}
 	}
-	rf.persistedIndex = rf.lastIndex() // the rewrite included every entry we hold
+	rf.persistedIndex = rf.lastIndex()
 }
 
 // ---------- state helpers: caller holds rf.mu ----------
@@ -287,11 +295,19 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.state == Leader
 }
 
-// LogLength is the number of entries kept since the last snapshot.
 func (rf *Raft) LogLength() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return len(rf.log) - 1
+}
+
+// SnapshotReady reports whether a snapshot at index would be accepted now:
+// the log is over maxLog entries and index is applied and durable locally.
+func (rf *Raft) SnapshotReady(index, maxLog int) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return len(rf.log)-1 > maxLog && index > rf.lastIncludedIndex &&
+		index <= rf.lastApplied && index <= rf.persistedIndex
 }
 
 func (rf *Raft) Start(command []byte) (int, int, bool) {
@@ -317,14 +333,18 @@ func (rf *Raft) Start(command []byte) (int, int, bool) {
 	return index, term, true
 }
 
-// Snapshot is called by the service: "my state includes everything up to index;
-// here it is." Raft discards those entries and persists the snapshot.
+// Snapshot trims the in-memory log and hands the snapshot to the background
+// saver. No disk I/O under rf.mu: raft-log still holds every entry until a
+// durable snapshot covers it, so a crash before the save is still safe.
 func (rf *Raft) Snapshot(index int, data []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if index <= rf.lastIncludedIndex || index > rf.lastApplied {
-		return // already covered, or not applied yet
+	// Only compact entries that are already durable on OUR disk. On a leader,
+	// followers alone can form a commit majority, so an applied entry may not
+	// be synced locally yet; compacting it would leave a gap in raft-log.
+	if index <= rf.lastIncludedIndex || index > rf.lastApplied || index > rf.persistedIndex {
+		return
 	}
 	newLog := make([]LogEntry, 0, rf.lastIndex()-index+1)
 	newLog = append(newLog, LogEntry{Term: rf.termAt(index)})
@@ -333,7 +353,16 @@ func (rf *Raft) Snapshot(index int, data []byte) {
 	rf.log = newLog
 	rf.lastIncludedIndex = index
 	rf.snapshot = data
-	rf.persistSnapshot()
+
+	if rf.persister != nil {
+		rf.pendingSaveIndex = index
+		rf.pendingSaveTerm = rf.log[0].Term
+		rf.pendingSaveData = data
+		select {
+		case rf.snapshotCh <- struct{}{}:
+		default: // saver already signalled; it will pick up the latest
+		}
+	}
 }
 
 func (rf *Raft) Kill() {
@@ -342,6 +371,15 @@ func (rf *Raft) Kill() {
 	rf.applyCond.Broadcast()
 	rf.syncCond.Broadcast()
 	rf.mu.Unlock()
+	select {
+	case rf.snapshotCh <- struct{}{}:
+	default:
+	}
+	// Wait for an in-progress snapshot save/compaction to finish, so nothing
+	// touches our files after Kill returns (a "join" on the saver goroutine).
+	if rf.saverDone != nil {
+		<-rf.saverDone
+	}
 }
 
 func (rf *Raft) killed() bool {
@@ -391,7 +429,6 @@ func (rf *Raft) applier() {
 
 		var msgs []ApplyMsg
 		if rf.snapshotPending {
-			// A snapshot always goes first: it replaces state up to lastIncludedIndex.
 			msgs = append(msgs, ApplyMsg{
 				SnapshotValid: true,
 				Snapshot:      rf.snapshot,
@@ -436,7 +473,13 @@ func (rf *Raft) leaderSyncer() {
 		copy(entries, source)
 		term := rf.currentTerm
 
-		rf.persister.mu.Lock() // order: rf.mu -> persister.mu
+		// Order rf.mu -> persister.mu. If a log compaction holds the file,
+		// don't sit on rf.mu waiting for it: release, back off, retry.
+		if !rf.persister.mu.TryLock() {
+			rf.mu.Unlock()
+			time.Sleep(time.Millisecond)
+			continue
+		}
 		rf.mu.Unlock()
 		err := rf.persister.appendLocked(from, entries, false)
 		rf.persister.mu.Unlock()
@@ -453,6 +496,36 @@ func (rf *Raft) leaderSyncer() {
 			rf.advanceCommitIndex()
 		}
 		rf.mu.Unlock()
+	}
+}
+
+// snapshotSaver writes snapshots handed over by Snapshot(), outside rf.mu,
+// then compacts raft-log on disk once it grows past logCompactBytes.
+func (rf *Raft) snapshotSaver() {
+	defer close(rf.saverDone)
+	for range rf.snapshotCh {
+		if rf.killed() {
+			return
+		}
+		rf.mu.Lock()
+		index := rf.pendingSaveIndex
+		term := rf.pendingSaveTerm
+		data := rf.pendingSaveData
+		rf.pendingSaveIndex = 0
+		rf.pendingSaveData = nil
+		rf.mu.Unlock()
+		if index == 0 {
+			continue
+		}
+
+		if err := rf.persister.SaveSnapshotFile(index, term, data); err != nil {
+			panic(fmt.Sprintf("raft %d: save snapshot: %v", rf.id, err))
+		}
+		if !rf.killed() && rf.persister.LogFileSize() > logCompactBytes {
+			if err := rf.persister.CompactLog(index); err != nil {
+				panic(fmt.Sprintf("raft %d: compact log: %v", rf.id, err))
+			}
+		}
 	}
 }
 
@@ -565,8 +638,6 @@ func (rf *Raft) replicateTo(peer int) {
 	}
 }
 
-// sendAppendEntriesOnce sends one AppendEntries (or InstallSnapshot if the
-// follower needs entries we've already compacted). Returns true to resend at once.
 func (rf *Raft) sendAppendEntriesOnce(peer int) bool {
 	rf.mu.Lock()
 	if rf.state != Leader {
@@ -674,7 +745,7 @@ func (rf *Raft) sendSnapshot(peer int, args InstallSnapshotArgs, term int) bool 
 	}
 	rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 	rf.advanceCommitIndex()
-	return true // follow up right away with the entries after the snapshot
+	return true
 }
 
 func (rf *Raft) HandleAppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -691,7 +762,6 @@ func (rf *Raft) HandleAppendEntries(args AppendEntriesArgs, reply *AppendEntries
 	reply.Term = rf.currentTerm
 
 	if args.PrevLogIndex < rf.lastIncludedIndex {
-		// Our snapshot already covers PrevLogIndex: ask the leader to start after it.
 		reply.ConflictIndex = rf.lastIncludedIndex + 1
 		reply.ConflictTerm = -1
 		return
@@ -730,6 +800,8 @@ func (rf *Raft) HandleAppendEntries(args AppendEntriesArgs, reply *AppendEntries
 	} else if rf.persistedIndex < rf.lastIndex() {
 		rf.persistLog(rf.persistedIndex+1, false)
 	}
+	// Time spent on our own disk isn't silence from the leader.
+	rf.resetElectionTimer()
 
 	if args.LeaderCommit > rf.commitIndex {
 		lastNewIndex := args.PrevLogIndex + len(args.Entries)
@@ -758,10 +830,9 @@ func (rf *Raft) HandleInstallSnapshot(args InstallSnapshotArgs, reply *InstallSn
 	reply.Term = rf.currentTerm
 
 	if args.LastIncludedIndex <= rf.commitIndex {
-		return // we already have (and will apply) everything it covers
+		return
 	}
 
-	// Keep entries after the snapshot only if our log agrees at its last index.
 	newLog := []LogEntry{{Term: args.LastIncludedTerm}}
 	if args.LastIncludedIndex < rf.lastIndex() && rf.termAt(args.LastIncludedIndex) == args.LastIncludedTerm {
 		newLog = append(newLog, rf.entriesFrom(args.LastIncludedIndex+1)...)
@@ -772,6 +843,11 @@ func (rf *Raft) HandleInstallSnapshot(args InstallSnapshotArgs, reply *InstallSn
 	rf.snapshot = args.Data
 	rf.commitIndex = args.LastIncludedIndex
 	rf.snapshotPending = true
-	rf.persistSnapshot() // durable before we reply
+	if rf.pendingSaveIndex <= args.LastIncludedIndex {
+		rf.pendingSaveIndex = 0 // an older background save is now pointless
+		rf.pendingSaveData = nil
+	}
+	rf.persistSnapshotSync() // durable before we reply
+	rf.resetElectionTimer()
 	rf.applyCond.Signal()
 }
