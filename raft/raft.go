@@ -80,19 +80,22 @@ type Transport interface {
 }
 
 type Raft struct {
-	mu        sync.Mutex
+	mu        sync.Mutex // lock order: rf.mu before persister.mu, everywhere
 	id        int
 	peerCount int
 	transport Transport
-	persister *Persister // nil = memory only (some tests, benchmarks)
+	persister *Persister // nil = memory only
 	dead      atomic.Bool
 	applyCh   chan<- ApplyMsg
-	applyCond *sync.Cond
+	applyCond *sync.Cond // wakes the applier when commitIndex moves
+	syncCond  *sync.Cond // wakes the leader syncer when new entries need persisting
 
-	// Persistent state (Figure 2): on disk before replying to any RPC.
+	// Persistent state (Figure 2)
 	currentTerm int
 	votedFor    int
 	log         []LogEntry // log[0] is a dummy (term 0)
+
+	persistedIndex int // highest log index known to be on disk
 
 	// Volatile state on all servers
 	commitIndex int
@@ -100,7 +103,7 @@ type Raft struct {
 
 	// Volatile state on leaders
 	nextIndex  []int
-	matchIndex []int
+	matchIndex []int // matchIndex[self] = persistedIndex: the leader counts itself only once durable
 
 	// Per-peer replication control: at most one AppendEntries in flight.
 	inFlight []bool
@@ -134,10 +137,15 @@ func NewRaft(id, peerCount int, transport Transport, applyCh chan<- ApplyMsg, pe
 		rf.votedFor = votedFor
 		rf.log = log
 	}
+	rf.persistedIndex = len(rf.log) - 1 // everything loaded is, by definition, on disk
 	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.syncCond = sync.NewCond(&rf.mu)
 	rf.resetElectionTimer()
 	go rf.ticker()
 	go rf.applier()
+	if persister != nil {
+		go rf.leaderSyncer()
+	}
 	return rf
 }
 
@@ -148,7 +156,6 @@ func randomElectionTimeout() time.Duration {
 
 // ---------- helpers: caller holds rf.mu ----------
 
-// A node that can't write to disk can't safely keep participating: stop hard.
 func (rf *Raft) persistTermVote() {
 	if rf.persister == nil {
 		return
@@ -158,13 +165,14 @@ func (rf *Raft) persistTermVote() {
 	}
 }
 
+// persistLog synchronously writes log[fromIndex:] (follower path).
 func (rf *Raft) persistLog(fromIndex int, truncate bool) {
-	if rf.persister == nil {
-		return
+	if rf.persister != nil {
+		if err := rf.persister.AppendLog(fromIndex, rf.log[fromIndex:], truncate); err != nil {
+			panic(fmt.Sprintf("raft %d: persist log: %v", rf.id, err))
+		}
 	}
-	if err := rf.persister.AppendLog(fromIndex, rf.log[fromIndex:], truncate); err != nil {
-		panic(fmt.Sprintf("raft %d: persist log: %v", rf.id, err))
-	}
+	rf.persistedIndex = len(rf.log) - 1
 }
 
 func (rf *Raft) resetElectionTimer() {
@@ -194,8 +202,9 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex[i] = len(rf.log)
 		rf.matchIndex[i] = 0
 	}
-	rf.matchIndex[rf.id] = len(rf.log) - 1
+	rf.matchIndex[rf.id] = rf.persistedIndex // only what is actually on our disk
 	rf.lastHeartbeatSent = time.Time{}
+	rf.syncCond.Signal() // persist any leftover unsynced tail
 }
 
 func (rf *Raft) advanceCommitIndex() {
@@ -225,6 +234,9 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.state == Leader
 }
 
+// Start appends to the in-memory log and returns immediately. With a persister,
+// the leader syncer makes it durable in batches; replication to followers
+// proceeds in parallel with that disk write.
 func (rf *Raft) Start(command []byte) (int, int, bool) {
 	rf.mu.Lock()
 	if rf.state != Leader {
@@ -235,9 +247,13 @@ func (rf *Raft) Start(command []byte) (int, int, bool) {
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
 	index := len(rf.log) - 1
 	term := rf.currentTerm
-	rf.persistLog(index, false) // leader's own copy is durable before it counts toward a majority
-	rf.matchIndex[rf.id] = index
-	rf.advanceCommitIndex()
+	if rf.persister == nil {
+		rf.persistedIndex = index
+		rf.matchIndex[rf.id] = index
+		rf.advanceCommitIndex()
+	} else {
+		rf.syncCond.Signal()
+	}
 	rf.mu.Unlock()
 
 	rf.broadcastAppendEntries()
@@ -248,6 +264,7 @@ func (rf *Raft) Kill() {
 	rf.dead.Store(true)
 	rf.mu.Lock()
 	rf.applyCond.Broadcast()
+	rf.syncCond.Broadcast()
 	rf.mu.Unlock()
 }
 
@@ -312,6 +329,51 @@ func (rf *Raft) applier() {
 	}
 }
 
+// leaderSyncer is group commit for the leader's own log: it persists every
+// unsynced entry with ONE fsync, outside rf.mu, so Start() keeps appending
+// (forming the next batch) while the disk works.
+func (rf *Raft) leaderSyncer() {
+	for {
+		rf.mu.Lock()
+		for !rf.killed() && !(rf.state == Leader && rf.persistedIndex < len(rf.log)-1) {
+			rf.syncCond.Wait()
+		}
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+
+		from := rf.persistedIndex + 1
+		to := len(rf.log) - 1
+		entries := make([]LogEntry, to-from+1)
+		copy(entries, rf.log[from:])
+		term := rf.currentTerm
+
+		// Take the persister lock BEFORE releasing rf.mu (order: rf.mu -> p.mu).
+		// Any follower-path write must now wait for ours, so the file's order
+		// always matches the log's order.
+		rf.persister.mu.Lock()
+		rf.mu.Unlock()
+		err := rf.persister.appendLocked(from, entries, false)
+		rf.persister.mu.Unlock()
+		if err != nil {
+			panic(fmt.Sprintf("raft %d: leader sync: %v", rf.id, err))
+		}
+
+		rf.mu.Lock()
+		// A leader never truncates its own log within its term, so if we are
+		// still leader of the same term, entries [from, to] are exactly what we wrote.
+		if rf.state == Leader && rf.currentTerm == term {
+			if to > rf.persistedIndex {
+				rf.persistedIndex = to
+			}
+			rf.matchIndex[rf.id] = rf.persistedIndex
+			rf.advanceCommitIndex()
+		}
+		rf.mu.Unlock()
+	}
+}
+
 // ---------- elections ----------
 
 func (rf *Raft) startElection() {
@@ -319,7 +381,7 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.state = Candidate
 	rf.votedFor = rf.id
-	rf.persistTermVote() // our own vote must survive a crash too
+	rf.persistTermVote()
 	rf.resetElectionTimer()
 	term := rf.currentTerm
 	lastIndex, lastTerm := rf.lastLogIndexAndTerm()
@@ -380,7 +442,7 @@ func (rf *Raft) HandleRequestVote(args RequestVoteArgs, reply *RequestVoteReply)
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateID) && upToDate {
 		rf.votedFor = args.CandidateID
-		rf.persistTermVote() // vote is on disk before the reply leaves
+		rf.persistTermVote()
 		reply.VoteGranted = true
 		rf.resetElectionTimer()
 	}
@@ -522,8 +584,7 @@ func (rf *Raft) HandleAppendEntries(args AppendEntriesArgs, reply *AppendEntries
 	}
 
 	// Append new entries; truncate only at a real conflict.
-	firstNew := -1
-	truncated := false
+	truncateAt := -1
 	for i, entry := range args.Entries {
 		index := args.PrevLogIndex + 1 + i
 		if index < len(rf.log) {
@@ -531,15 +592,18 @@ func (rf *Raft) HandleAppendEntries(args AppendEntriesArgs, reply *AppendEntries
 				continue
 			}
 			rf.log = rf.log[:index]
-			truncated = true
-		}
-		if firstNew == -1 {
-			firstNew = index
+			truncateAt = index
 		}
 		rf.log = append(rf.log, entry)
 	}
-	if firstNew != -1 {
-		rf.persistLog(firstNew, truncated) // one fsync for the whole batch, before replying
+
+	// Persist before replying. This also covers an ex-leader whose in-memory
+	// tail was never synced: we must not acknowledge entries that aren't on disk.
+	needTruncate := truncateAt != -1 && truncateAt <= rf.persistedIndex
+	if needTruncate {
+		rf.persistLog(truncateAt, true)
+	} else if rf.persistedIndex < len(rf.log)-1 {
+		rf.persistLog(rf.persistedIndex+1, false)
 	}
 
 	if args.LeaderCommit > rf.commitIndex {

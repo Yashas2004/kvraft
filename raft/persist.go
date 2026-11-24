@@ -165,10 +165,14 @@ func (p *Persister) SaveTermVote(term, votedFor int) error {
 func (p *Persister) AppendLog(fromIndex int, entries []LogEntry, truncate bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.appendLocked(fromIndex, entries, truncate)
+}
+
+// appendLocked is AppendLog for callers that already hold p.mu (the leader syncer).
+func (p *Persister) appendLocked(fromIndex int, entries []LogEntry, truncate bool) error {
 	if p.closed {
 		return nil
 	}
-
 	var buf []byte
 	if truncate {
 		buf = append(buf, encodeLogRecord(recTruncate, fromIndex, 0, nil)...)
