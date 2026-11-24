@@ -100,6 +100,11 @@ type Raft struct {
 	nextIndex  []int // next log index to send to each peer
 	matchIndex []int // highest index known to be replicated on each peer
 
+	// Per-peer replication control: at most one AppendEntries in flight.
+	// Requests arriving meanwhile set pending and get batched into the next RPC.
+	inFlight []bool
+	pending  []bool
+
 	state             State
 	lastHeard         time.Time
 	electionTimeout   time.Duration
@@ -114,6 +119,8 @@ func NewRaft(id, peerCount int, transport Transport, applyCh chan<- ApplyMsg) *R
 		applyCh:   applyCh,
 		votedFor:  -1,
 		log:       []LogEntry{{Term: 0}},
+		inFlight:  make([]bool, peerCount),
+		pending:   make([]bool, peerCount),
 		state:     Follower,
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
@@ -364,11 +371,43 @@ func (rf *Raft) broadcastAppendEntries() {
 	}
 }
 
+// replicateTo keeps at most one AppendEntries in flight per peer.
+// Calls that arrive while one is outstanding just mark pending; the next
+// RPC then carries every entry that accumulated (natural batching).
 func (rf *Raft) replicateTo(peer int) {
+	rf.mu.Lock()
+	if rf.inFlight[peer] {
+		rf.pending[peer] = true
+		rf.mu.Unlock()
+		return
+	}
+	rf.inFlight[peer] = true
+	rf.mu.Unlock()
+
+	for !rf.killed() {
+		retry := rf.sendAppendEntriesOnce(peer)
+
+		rf.mu.Lock()
+		// Check pending and clear inFlight under the same lock: no lost wakeups.
+		if (!retry && !rf.pending[peer]) || rf.state != Leader {
+			rf.inFlight[peer] = false
+			rf.pending[peer] = false
+			rf.mu.Unlock()
+			return
+		}
+		rf.pending[peer] = false
+		rf.mu.Unlock()
+	}
+}
+
+// sendAppendEntriesOnce sends one AppendEntries and processes the reply.
+// Returns true if the follower rejected it and we should retry immediately
+// from the earlier point we just backed up to.
+func (rf *Raft) sendAppendEntriesOnce(peer int) bool {
 	rf.mu.Lock()
 	if rf.state != Leader {
 		rf.mu.Unlock()
-		return
+		return false
 	}
 	next := rf.nextIndex[peer]
 	prevIndex := next - 1
@@ -387,7 +426,7 @@ func (rf *Raft) replicateTo(peer int) {
 
 	var reply AppendEntriesReply
 	if !rf.transport.AppendEntries(peer, args, &reply) {
-		return
+		return false
 	}
 
 	rf.mu.Lock()
@@ -395,10 +434,10 @@ func (rf *Raft) replicateTo(peer int) {
 
 	if reply.Term > rf.currentTerm {
 		rf.becomeFollower(reply.Term)
-		return
+		return false
 	}
 	if rf.state != Leader || rf.currentTerm != term {
-		return // stale reply from an older term
+		return false // stale reply from an older term
 	}
 
 	if reply.Success {
@@ -408,12 +447,12 @@ func (rf *Raft) replicateTo(peer int) {
 		}
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 		rf.advanceCommitIndex()
-		return
+		return false
 	}
 
 	// Rejected. Ignore if nextIndex already moved since we sent this.
 	if rf.nextIndex[peer] != args.PrevLogIndex+1 {
-		return
+		return false
 	}
 	if reply.ConflictTerm == -1 {
 		rf.nextIndex[peer] = reply.ConflictIndex // follower's log is too short
@@ -434,7 +473,7 @@ func (rf *Raft) replicateTo(peer int) {
 	if rf.nextIndex[peer] < 1 {
 		rf.nextIndex[peer] = 1
 	}
-	go rf.replicateTo(peer) // retry right away from the earlier point
+	return true // retry right away from the earlier point
 }
 
 func (rf *Raft) HandleAppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {

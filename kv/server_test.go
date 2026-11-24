@@ -164,8 +164,9 @@ func TestReportReplication(t *testing.T) {
 		}
 		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 		throughput := float64(len(latencies)) / duration.Seconds()
-		p50 := latencies[len(latencies)/2]
+
 		p99 := latencies[len(latencies)*99/100]
-		t.Logf("clients=%-3d  ops/s=%8.0f  p50=%-10v p99=%v", clients, throughput, p50, p99)
+		meanLatency := time.Duration(float64(clients) / throughput * float64(time.Second)) // Little's Law
+		t.Logf("clients=%-3d  ops/s=%8.0f  mean=%-10v p99=%v", clients, throughput, meanLatency, p99)
 	}
 }
