@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Yashas2004/kvraft/raft"
@@ -139,6 +140,7 @@ type Server struct {
 
 	applyMu     sync.Mutex // held for every apply; Kill takes it too
 	dead        bool
+	killed      atomic.Bool // fast check for submit; dead (under applyMu) guards applies
 	lastApplied int
 	lastSeq     map[int64]int64 // clientID -> highest seq applied (dedup table, in snapshots)
 
@@ -159,6 +161,12 @@ func NewServer(rf *raft.Raft, db *storage.DB, applyCh <-chan raft.ApplyMsg, maxR
 		maxRaftLog: maxRaftLog,
 		lastSeq:    make(map[int64]int64),
 	}
+	// The storage engine is a materialized view of Raft's snapshot + log, not the
+	// source of truth. Raft will redeliver the snapshot and replay the log tail,
+	// so start from an empty view: redoing appends onto old state double-applies them.
+	if err := db.RestoreFrom(nil); err != nil {
+		panic(fmt.Sprintf("kv: reset storage engine: %v", err))
+	}
 	go s.applyLoop(applyCh)
 	return s
 }
@@ -169,8 +177,9 @@ func (s *Server) IsLeader() bool {
 }
 
 func (s *Server) Kill() {
-	s.rf.Kill()
-	s.applyMu.Lock()
+	s.killed.Store(true) // new requests are rejected right away
+	s.rf.Kill()          // stop Raft (also joins its snapshot saver)
+	s.applyMu.Lock()     // wait for any in-progress apply to finish
 	s.dead = true
 	s.applyMu.Unlock()
 }
@@ -270,6 +279,10 @@ func (s *Server) takeSnapshot(index int) {
 }
 
 func (s *Server) submit(op byte, clientID, seq int64, key, value []byte) (result, error) {
+	if s.killed.Load() {
+		return result{}, ErrWrongLeader
+	}
+
 	cmd := encodeCommand(op, clientID, seq, key, value)
 	ch := make(chan result, 1)
 
