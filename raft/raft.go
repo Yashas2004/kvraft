@@ -142,6 +142,9 @@ func (rf *Raft) ticker() {
 		shouldElect := false
 		shouldHeartbeat := false
 		if rf.state == Leader {
+			// A leader never times out. Keeping lastHeard fresh means that if it
+			// steps down, it starts with a full timeout instead of electing instantly.
+			rf.lastHeard = time.Now()
 			if time.Since(rf.lastHeartbeatSent) >= heartbeatInterval {
 				rf.lastHeartbeatSent = time.Now()
 				shouldHeartbeat = true

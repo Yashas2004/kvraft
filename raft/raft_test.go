@@ -241,3 +241,23 @@ func TestElectionTimeDistribution(t *testing.T) {
 	t.Logf("failover time: min %v  p50 %v  p90 %v  max %v",
 		durations[0], durations[len(durations)/2], durations[len(durations)*9/10], durations[len(durations)-1])
 }
+
+func TestRejoinDoesNotDisrupt(t *testing.T) {
+	c := newCluster(t, 3)
+
+	for round := 0; round < 5; round++ {
+		oldLeader := c.checkOneLeader()
+		c.disconnect(oldLeader)
+		c.checkOneLeader()
+		time.Sleep(50 * time.Millisecond)
+		termBefore := c.checkTermsAgree() // agreement among the 2 connected nodes
+
+		c.connect(oldLeader)
+		time.Sleep(2 * electionTimeoutMax)
+
+		termAfter := c.checkTermsAgree()
+		if termAfter != termBefore {
+			t.Fatalf("round %d: rejoining node forced an election (term %d -> %d)", round, termBefore, termAfter)
+		}
+	}
+}
