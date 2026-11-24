@@ -20,7 +20,7 @@ func startTCPCluster(t *testing.T, n int) ([]*Raft, []net.Listener) {
 
 	nodes := make([]*Raft, n)
 	for i := 0; i < n; i++ {
-		nodes[i] = NewRaft(i, n, NewTCPTransport(addrs), nil)
+		nodes[i] = NewRaft(i, n, NewTCPTransport(addrs), nil, nil)
 		if err := Serve(nodes[i], listeners[i]); err != nil {
 			t.Fatal(err)
 		}
@@ -91,7 +91,7 @@ func BenchmarkTCPRequestVoteRoundTrip(b *testing.B) {
 	}
 	addrs := []string{ln.Addr().String(), "127.0.0.1:1"} // node 1 doesn't exist; fine for this test
 
-	rf := NewRaft(0, 2, NewTCPTransport(addrs), nil)
+	rf := NewRaft(0, 2, NewTCPTransport(addrs), nil, nil)
 	if err := Serve(rf, ln); err != nil {
 		b.Fatal(err)
 	}

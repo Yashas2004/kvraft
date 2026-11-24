@@ -24,7 +24,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	rf := raft.NewRaft(*id, len(addrs), raft.NewTCPTransport(addrs), nil)
+	rf := raft.NewRaft(*id, len(addrs), raft.NewTCPTransport(addrs), nil, nil)
 	if err := raft.Serve(rf, ln); err != nil {
 		log.Fatal(err)
 	}

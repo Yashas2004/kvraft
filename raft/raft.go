@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -69,8 +70,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term          int
 	Success       bool
-	ConflictIndex int // on failure: where the leader should retry from
-	ConflictTerm  int // on failure: term of the conflicting entry, or -1 if our log is too short
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 type Transport interface {
@@ -83,25 +84,25 @@ type Raft struct {
 	id        int
 	peerCount int
 	transport Transport
+	persister *Persister // nil = memory only (some tests, benchmarks)
 	dead      atomic.Bool
-	applyCh   chan<- ApplyMsg // may be nil (election-only tests)
-	applyCond *sync.Cond      // signals the applier when commitIndex moves
+	applyCh   chan<- ApplyMsg
+	applyCond *sync.Cond
 
-	// Persistent state (Figure 2). Saved to disk in Week 6.
+	// Persistent state (Figure 2): on disk before replying to any RPC.
 	currentTerm int
 	votedFor    int
-	log         []LogEntry // log[0] is a dummy (term 0), so real entries start at index 1
+	log         []LogEntry // log[0] is a dummy (term 0)
 
 	// Volatile state on all servers
 	commitIndex int
 	lastApplied int
 
-	// Volatile state on leaders (reset on every election win)
-	nextIndex  []int // next log index to send to each peer
-	matchIndex []int // highest index known to be replicated on each peer
+	// Volatile state on leaders
+	nextIndex  []int
+	matchIndex []int
 
 	// Per-peer replication control: at most one AppendEntries in flight.
-	// Requests arriving meanwhile set pending and get batched into the next RPC.
 	inFlight []bool
 	pending  []bool
 
@@ -111,17 +112,27 @@ type Raft struct {
 	lastHeartbeatSent time.Time
 }
 
-func NewRaft(id, peerCount int, transport Transport, applyCh chan<- ApplyMsg) *Raft {
+func NewRaft(id, peerCount int, transport Transport, applyCh chan<- ApplyMsg, persister *Persister) *Raft {
 	rf := &Raft{
 		id:        id,
 		peerCount: peerCount,
 		transport: transport,
+		persister: persister,
 		applyCh:   applyCh,
 		votedFor:  -1,
 		log:       []LogEntry{{Term: 0}},
 		inFlight:  make([]bool, peerCount),
 		pending:   make([]bool, peerCount),
 		state:     Follower,
+	}
+	if persister != nil {
+		term, votedFor, log, err := persister.LoadState()
+		if err != nil {
+			panic(fmt.Sprintf("raft %d: cannot load persisted state: %v", id, err))
+		}
+		rf.currentTerm = term
+		rf.votedFor = votedFor
+		rf.log = log
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.resetElectionTimer()
@@ -137,6 +148,25 @@ func randomElectionTimeout() time.Duration {
 
 // ---------- helpers: caller holds rf.mu ----------
 
+// A node that can't write to disk can't safely keep participating: stop hard.
+func (rf *Raft) persistTermVote() {
+	if rf.persister == nil {
+		return
+	}
+	if err := rf.persister.SaveTermVote(rf.currentTerm, rf.votedFor); err != nil {
+		panic(fmt.Sprintf("raft %d: persist term/vote: %v", rf.id, err))
+	}
+}
+
+func (rf *Raft) persistLog(fromIndex int, truncate bool) {
+	if rf.persister == nil {
+		return
+	}
+	if err := rf.persister.AppendLog(fromIndex, rf.log[fromIndex:], truncate); err != nil {
+		panic(fmt.Sprintf("raft %d: persist log: %v", rf.id, err))
+	}
+}
+
 func (rf *Raft) resetElectionTimer() {
 	rf.lastHeard = time.Now()
 	rf.electionTimeout = randomElectionTimeout()
@@ -151,6 +181,7 @@ func (rf *Raft) becomeFollower(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.votedFor = -1
+		rf.persistTermVote()
 	}
 	rf.state = Follower
 }
@@ -160,19 +191,17 @@ func (rf *Raft) becomeLeader() {
 	rf.nextIndex = make([]int, rf.peerCount)
 	rf.matchIndex = make([]int, rf.peerCount)
 	for i := 0; i < rf.peerCount; i++ {
-		rf.nextIndex[i] = len(rf.log) // optimistic: assume followers match us
-		rf.matchIndex[i] = 0          // pessimistic: nothing confirmed yet
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
 	}
 	rf.matchIndex[rf.id] = len(rf.log) - 1
-	rf.lastHeartbeatSent = time.Time{} // heartbeat on the next tick
+	rf.lastHeartbeatSent = time.Time{}
 }
 
-// advanceCommitIndex finds the highest index stored on a majority
-// whose entry is from the current term (§5.4.2), and commits up to it.
 func (rf *Raft) advanceCommitIndex() {
 	for n := len(rf.log) - 1; n > rf.commitIndex; n-- {
 		if rf.log[n].Term != rf.currentTerm {
-			continue // never commit old-term entries by counting (Figure 8)
+			continue // Figure 8: only count replicas of current-term entries
 		}
 		count := 0
 		for peer := 0; peer < rf.peerCount; peer++ {
@@ -196,9 +225,6 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.state == Leader
 }
 
-// Start proposes a command. Returns the index it will occupy if committed,
-// the current term, and whether this node is the leader. No guarantee it commits:
-// the leader could fail first.
 func (rf *Raft) Start(command []byte) (int, int, bool) {
 	rf.mu.Lock()
 	if rf.state != Leader {
@@ -209,18 +235,19 @@ func (rf *Raft) Start(command []byte) (int, int, bool) {
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
 	index := len(rf.log) - 1
 	term := rf.currentTerm
+	rf.persistLog(index, false) // leader's own copy is durable before it counts toward a majority
 	rf.matchIndex[rf.id] = index
-	rf.advanceCommitIndex() // only matters for a 1-node cluster
+	rf.advanceCommitIndex()
 	rf.mu.Unlock()
 
-	rf.broadcastAppendEntries() // replicate now instead of waiting for the next heartbeat
+	rf.broadcastAppendEntries()
 	return index, term, true
 }
 
 func (rf *Raft) Kill() {
 	rf.dead.Store(true)
 	rf.mu.Lock()
-	rf.applyCond.Broadcast() // wake the applier so it can exit
+	rf.applyCond.Broadcast()
 	rf.mu.Unlock()
 }
 
@@ -238,7 +265,7 @@ func (rf *Raft) ticker() {
 		shouldElect := false
 		shouldHeartbeat := false
 		if rf.state == Leader {
-			rf.lastHeard = time.Now() // so a stepped-down leader waits a full timeout
+			rf.lastHeard = time.Now()
 			if time.Since(rf.lastHeartbeatSent) >= heartbeatInterval {
 				rf.lastHeartbeatSent = time.Now()
 				shouldHeartbeat = true
@@ -257,14 +284,11 @@ func (rf *Raft) ticker() {
 	}
 }
 
-// applier is the consumer: it waits for commitIndex to move, then delivers
-// entries in order. It never holds mu while sending on applyCh.
 func (rf *Raft) applier() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	for !rf.killed() {
-		// Mesa semantics: always re-check the condition after waking.
 		for rf.lastApplied >= rf.commitIndex && !rf.killed() {
 			rf.applyCond.Wait()
 		}
@@ -295,6 +319,7 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.state = Candidate
 	rf.votedFor = rf.id
+	rf.persistTermVote() // our own vote must survive a crash too
 	rf.resetElectionTimer()
 	term := rf.currentTerm
 	lastIndex, lastTerm := rf.lastLogIndexAndTerm()
@@ -349,13 +374,13 @@ func (rf *Raft) HandleRequestVote(args RequestVoteArgs, reply *RequestVoteReply)
 		return
 	}
 
-	// Election restriction (§5.4.1): candidate's log must be at least as up-to-date as ours.
 	myLastIndex, myLastTerm := rf.lastLogIndexAndTerm()
 	upToDate := args.LastLogTerm > myLastTerm ||
 		(args.LastLogTerm == myLastTerm && args.LastLogIndex >= myLastIndex)
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateID) && upToDate {
 		rf.votedFor = args.CandidateID
+		rf.persistTermVote() // vote is on disk before the reply leaves
 		reply.VoteGranted = true
 		rf.resetElectionTimer()
 	}
@@ -371,9 +396,6 @@ func (rf *Raft) broadcastAppendEntries() {
 	}
 }
 
-// replicateTo keeps at most one AppendEntries in flight per peer.
-// Calls that arrive while one is outstanding just mark pending; the next
-// RPC then carries every entry that accumulated (natural batching).
 func (rf *Raft) replicateTo(peer int) {
 	rf.mu.Lock()
 	if rf.inFlight[peer] {
@@ -388,7 +410,6 @@ func (rf *Raft) replicateTo(peer int) {
 		retry := rf.sendAppendEntriesOnce(peer)
 
 		rf.mu.Lock()
-		// Check pending and clear inFlight under the same lock: no lost wakeups.
 		if (!retry && !rf.pending[peer]) || rf.state != Leader {
 			rf.inFlight[peer] = false
 			rf.pending[peer] = false
@@ -400,9 +421,6 @@ func (rf *Raft) replicateTo(peer int) {
 	}
 }
 
-// sendAppendEntriesOnce sends one AppendEntries and processes the reply.
-// Returns true if the follower rejected it and we should retry immediately
-// from the earlier point we just backed up to.
 func (rf *Raft) sendAppendEntriesOnce(peer int) bool {
 	rf.mu.Lock()
 	if rf.state != Leader {
@@ -412,7 +430,7 @@ func (rf *Raft) sendAppendEntriesOnce(peer int) bool {
 	next := rf.nextIndex[peer]
 	prevIndex := next - 1
 	entries := make([]LogEntry, len(rf.log)-next)
-	copy(entries, rf.log[next:]) // copy: the log may change after we unlock
+	copy(entries, rf.log[next:])
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderID:     rf.id,
@@ -437,12 +455,12 @@ func (rf *Raft) sendAppendEntriesOnce(peer int) bool {
 		return false
 	}
 	if rf.state != Leader || rf.currentTerm != term {
-		return false // stale reply from an older term
+		return false
 	}
 
 	if reply.Success {
 		newMatch := args.PrevLogIndex + len(args.Entries)
-		if newMatch > rf.matchIndex[peer] { // replies can arrive out of order
+		if newMatch > rf.matchIndex[peer] {
 			rf.matchIndex[peer] = newMatch
 		}
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
@@ -450,12 +468,11 @@ func (rf *Raft) sendAppendEntriesOnce(peer int) bool {
 		return false
 	}
 
-	// Rejected. Ignore if nextIndex already moved since we sent this.
 	if rf.nextIndex[peer] != args.PrevLogIndex+1 {
 		return false
 	}
 	if reply.ConflictTerm == -1 {
-		rf.nextIndex[peer] = reply.ConflictIndex // follower's log is too short
+		rf.nextIndex[peer] = reply.ConflictIndex
 	} else {
 		lastIndexOfTerm := -1
 		for i := len(rf.log) - 1; i > 0; i-- {
@@ -467,13 +484,13 @@ func (rf *Raft) sendAppendEntriesOnce(peer int) bool {
 		if lastIndexOfTerm != -1 {
 			rf.nextIndex[peer] = lastIndexOfTerm + 1
 		} else {
-			rf.nextIndex[peer] = reply.ConflictIndex // skip the follower's whole conflicting term
+			rf.nextIndex[peer] = reply.ConflictIndex
 		}
 	}
 	if rf.nextIndex[peer] < 1 {
 		rf.nextIndex[peer] = 1
 	}
-	return true // retry right away from the earlier point
+	return true
 }
 
 func (rf *Raft) HandleAppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -489,7 +506,6 @@ func (rf *Raft) HandleAppendEntries(args AppendEntriesArgs, reply *AppendEntries
 	rf.resetElectionTimer()
 	reply.Term = rf.currentTerm
 
-	// Consistency check: do we have the entry right before the new ones?
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.ConflictIndex = len(rf.log)
 		reply.ConflictTerm = -1
@@ -499,23 +515,31 @@ func (rf *Raft) HandleAppendEntries(args AppendEntriesArgs, reply *AppendEntries
 		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
 		index := args.PrevLogIndex
 		for index > 1 && rf.log[index-1].Term == reply.ConflictTerm {
-			index-- // find the first entry of the conflicting term
+			index--
 		}
 		reply.ConflictIndex = index
 		return
 	}
 
-	// Append new entries. Truncate ONLY at a real conflict, so a delayed,
-	// older AppendEntries can never erase entries we already accepted.
+	// Append new entries; truncate only at a real conflict.
+	firstNew := -1
+	truncated := false
 	for i, entry := range args.Entries {
 		index := args.PrevLogIndex + 1 + i
 		if index < len(rf.log) {
 			if rf.log[index].Term == entry.Term {
-				continue // already have this exact entry
+				continue
 			}
-			rf.log = rf.log[:index] // conflict: drop it and everything after
+			rf.log = rf.log[:index]
+			truncated = true
+		}
+		if firstNew == -1 {
+			firstNew = index
 		}
 		rf.log = append(rf.log, entry)
+	}
+	if firstNew != -1 {
+		rf.persistLog(firstNew, truncated) // one fsync for the whole batch, before replying
 	}
 
 	if args.LeaderCommit > rf.commitIndex {

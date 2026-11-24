@@ -25,9 +25,15 @@ func startKVCluster(t *testing.T, n int) []*Server {
 	}
 
 	servers := make([]*Server, n)
+	persisters := make([]*raft.Persister, n)
 	for i := 0; i < n; i++ {
 		applyCh := make(chan raft.ApplyMsg)
-		rf := raft.NewRaft(i, n, raft.NewTCPTransport(addrs), applyCh)
+		persister, err := raft.OpenPersister(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		persisters[i] = persister
+		rf := raft.NewRaft(i, n, raft.NewTCPTransport(addrs), applyCh, persister)
 		if err := raft.Serve(rf, listeners[i]); err != nil {
 			t.Fatal(err)
 		}
@@ -44,7 +50,9 @@ func startKVCluster(t *testing.T, n int) []*Server {
 			listeners[i].Close()
 		}
 		for i := 0; i < n; i++ {
-			servers[i].db.Close() // before TempDir cleanup: Windows can't delete open files
+			// Close files before TempDir cleanup: Windows can't delete open files.
+			servers[i].db.Close()
+			persisters[i].Close()
 		}
 	})
 	return servers

@@ -3,6 +3,8 @@ package raft
 import (
 	"fmt"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"testing"
@@ -55,12 +57,15 @@ func (lt *localTransport) AppendEntries(peer int, args AppendEntriesArgs, reply 
 // ---------- cluster helpers ----------
 
 type cluster struct {
-	t        *testing.T
-	net      *network
-	n        int
-	mu       sync.Mutex
-	logs     [][]string // logs[i] = commands applied by node i, in order
-	finished bool
+	t          *testing.T
+	net        *network
+	n          int
+	mu         sync.Mutex
+	logs       [][]string // logs[i] = commands applied by node i's current incarnation
+	generation []int      // bumped on every restart; old incarnations' applies are ignored
+	persisters []*Persister
+	dirs       []string
+	finished   bool
 }
 
 func newCluster(t *testing.T, n int) *cluster {
@@ -68,26 +73,68 @@ func newCluster(t *testing.T, n int) *cluster {
 	for i := 0; i < n; i++ {
 		net.connected[i] = true
 	}
-	c := &cluster{t: t, net: net, n: n, logs: make([][]string, n)}
-
+	c := &cluster{
+		t:          t,
+		net:        net,
+		n:          n,
+		logs:       make([][]string, n),
+		generation: make([]int, n),
+		persisters: make([]*Persister, n),
+		dirs:       make([]string, n),
+	}
 	for i := 0; i < n; i++ {
-		applyCh := make(chan ApplyMsg)
-		go c.applyLoop(i, applyCh)
-		rf := NewRaft(i, n, &localTransport{net: net, from: i}, applyCh)
-		net.mu.Lock()
-		net.nodes[i] = rf
-		net.mu.Unlock()
+		c.dirs[i] = t.TempDir()
+		c.start(i)
 	}
 
 	t.Cleanup(func() {
 		c.mu.Lock()
 		c.finished = true // stop reporting from background goroutines
 		c.mu.Unlock()
-		for _, rf := range net.nodes {
-			rf.Kill()
+		for i := 0; i < n; i++ {
+			c.net.node(i).Kill()
+			c.persisters[i].Close() // before TempDir cleanup: Windows can't delete open files
 		}
 	})
 	return c
+}
+
+// start boots node i from whatever its persister has on disk.
+func (c *cluster) start(i int) {
+	persister, err := OpenPersister(c.dirs[i])
+	if err != nil {
+		c.t.Fatal(err)
+	}
+
+	c.mu.Lock()
+	c.generation[i]++
+	gen := c.generation[i]
+	c.logs[i] = nil // a restarted node re-applies its log from index 1
+	c.persisters[i] = persister
+	c.mu.Unlock()
+
+	applyCh := make(chan ApplyMsg)
+	go c.applyLoop(i, gen, applyCh)
+	rf := NewRaft(i, c.n, &localTransport{net: c.net, from: i}, applyCh, persister)
+
+	c.net.mu.Lock()
+	c.net.nodes[i] = rf
+	c.net.mu.Unlock()
+}
+
+// crash: node stops instantly and keeps only what reached its disk.
+func (c *cluster) crash(i int) {
+	c.disconnect(i)
+	c.net.node(i).Kill()
+	c.mu.Lock()
+	persister := c.persisters[i]
+	c.mu.Unlock()
+	persister.Close() // any write after this point is lost, like a power cut
+}
+
+func (c *cluster) restart(i int) {
+	c.start(i)
+	c.connect(i)
 }
 
 func (c *cluster) setConnected(id int, up bool) {
@@ -181,7 +228,7 @@ func (c *cluster) newLeaderAbove(oldTerm int) bool {
 	return false
 }
 
-// ---------- tests ----------
+// ---------- election tests ----------
 
 func TestInitialElection(t *testing.T) {
 	c := newCluster(t, 3)
@@ -278,17 +325,17 @@ func TestRejoinDoesNotDisrupt(t *testing.T) {
 
 // ---------- replication helpers ----------
 
-func (c *cluster) applyLoop(i int, applyCh chan ApplyMsg) {
+func (c *cluster) applyLoop(i, gen int, applyCh chan ApplyMsg) {
 	for msg := range applyCh {
-		c.recordApply(i, msg)
+		c.recordApply(i, gen, msg)
 	}
 }
 
-func (c *cluster) recordApply(i int, msg ApplyMsg) {
+func (c *cluster) recordApply(i, gen int, msg ApplyMsg) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.finished {
-		return
+	if c.finished || gen != c.generation[i] {
+		return // test over, or message from a crashed incarnation
 	}
 
 	expected := len(c.logs[i]) + 1
@@ -423,4 +470,118 @@ func TestConflictingLogsAreRepaired(t *testing.T) {
 			t.Fatalf("index %d: expected won-%d on 3 nodes, got %q on %d", index, index-1, command, count)
 		}
 	}
+}
+
+// ---------- persistence tests ----------
+
+func TestPersisterFile(t *testing.T) {
+	dir := t.TempDir()
+	p, err := OpenPersister(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.SaveTermVote(5, 2)
+	p.AppendLog(1, []LogEntry{{1, []byte("a")}, {1, []byte("b")}, {2, []byte("c")}}, false)
+	p.AppendLog(2, []LogEntry{{3, []byte("x")}}, true) // replace b, c with x
+	p.Close()
+
+	// Simulate a crash mid-write: garbage at the end of the log file.
+	f, err := os.OpenFile(filepath.Join(dir, "raft-log"), os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write([]byte{9, 9, 9, 9, 9})
+	f.Close()
+
+	p2, err := OpenPersister(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p2.Close()
+	term, votedFor, log, err := p2.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if term != 5 || votedFor != 2 {
+		t.Fatalf("term/vote: got %d/%d, expected 5/2", term, votedFor)
+	}
+	if len(log) != 3 || string(log[1].Command) != "a" || string(log[2].Command) != "x" || log[2].Term != 3 {
+		t.Fatalf("log wrong after truncate + torn tail: %+v", log)
+	}
+}
+
+func TestRestartAll(t *testing.T) {
+	c := newCluster(t, 3)
+	c.one("a", 3)
+
+	for i := 0; i < 3; i++ {
+		c.crash(i)
+	}
+	for i := 0; i < 3; i++ {
+		c.restart(i)
+	}
+
+	index := c.one("b", 3)
+	if index != 2 {
+		t.Fatalf("expected b at index 2 (log survived restart), got %d", index)
+	}
+	if count, command := c.nCommitted(1); count != 3 || command != "a" {
+		t.Fatalf("index 1 after restart: %q on %d nodes", command, count)
+	}
+}
+
+func TestCrashLeaderAndRestart(t *testing.T) {
+	c := newCluster(t, 3)
+	c.one("a", 3)
+
+	leader := c.checkOneLeader()
+	c.crash(leader)
+	c.one("b", 2)
+
+	c.restart(leader)
+	last := c.one("c", 3)
+	for index := 1; index <= last; index++ {
+		if count, _ := c.nCommitted(index); count != 3 {
+			t.Fatalf("index %d applied on %d nodes, expected 3", index, count)
+		}
+	}
+}
+
+// Random crashes and restarts while commands are proposed. The apply checker
+// fails the test if any two nodes ever apply different commands at one index.
+func TestPersistChurn(t *testing.T) {
+	c := newCluster(t, 5)
+	c.one("init", 5)
+	alive := []bool{true, true, true, true, true}
+
+	for iter := 0; iter < 30; iter++ {
+		for i := 0; i < 5; i++ {
+			if alive[i] {
+				c.net.node(i).Start([]byte(fmt.Sprintf("churn-%d-%d", iter, i)))
+			}
+		}
+		time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+
+		down := 0
+		for i := 0; i < 5; i++ {
+			if !alive[i] {
+				down++
+			}
+		}
+		victim := rand.Intn(5)
+		if alive[victim] && down < 2 {
+			c.crash(victim) // never more than 2 of 5 down: a majority stays up
+			alive[victim] = false
+		} else if !alive[victim] {
+			c.restart(victim)
+			alive[victim] = true
+		}
+	}
+
+	for i := 0; i < 5; i++ {
+		if !alive[i] {
+			c.restart(i)
+		}
+	}
+	c.one("final", 5)
 }
