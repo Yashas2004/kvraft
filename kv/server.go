@@ -3,6 +3,7 @@ package kv
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -41,6 +42,53 @@ func decodeCommand(cmd []byte) (byte, []byte, []byte) {
 	return cmd[0], key, value
 }
 
+// Snapshot format: count (4B) | { keyLen (4B) | valLen (4B) | key | value } ...
+func encodeSnapshot(entries []storage.Entry) []byte {
+	size := 4
+	for _, e := range entries {
+		size += 8 + len(e.Key) + len(e.Value)
+	}
+	buf := make([]byte, size)
+	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(entries)))
+	pos := 4
+	for _, e := range entries {
+		binary.LittleEndian.PutUint32(buf[pos:pos+4], uint32(len(e.Key)))
+		binary.LittleEndian.PutUint32(buf[pos+4:pos+8], uint32(len(e.Value)))
+		pos += 8
+		copy(buf[pos:], e.Key)
+		pos += len(e.Key)
+		copy(buf[pos:], e.Value)
+		pos += len(e.Value)
+	}
+	return buf
+}
+
+func decodeSnapshot(data []byte) ([]storage.Entry, error) {
+	if len(data) < 4 {
+		return nil, errors.New("kv: snapshot too short")
+	}
+	count := int(binary.LittleEndian.Uint32(data[0:4]))
+	pos := 4
+	entries := make([]storage.Entry, 0, count)
+	for i := 0; i < count; i++ {
+		if pos+8 > len(data) {
+			return nil, errors.New("kv: corrupt snapshot")
+		}
+		keyLen := int(binary.LittleEndian.Uint32(data[pos : pos+4]))
+		valLen := int(binary.LittleEndian.Uint32(data[pos+4 : pos+8]))
+		pos += 8
+		if pos+keyLen+valLen > len(data) {
+			return nil, errors.New("kv: corrupt snapshot")
+		}
+		key := data[pos : pos+keyLen]
+		pos += keyLen
+		value := data[pos : pos+valLen]
+		pos += valLen
+		entries = append(entries, storage.Entry{Key: key, Value: value})
+	}
+	return entries, nil
+}
+
 type result struct {
 	term  int
 	value []byte
@@ -49,16 +97,28 @@ type result struct {
 }
 
 type Server struct {
-	rf      *raft.Raft
-	db      *storage.DB
-	mu      sync.Mutex          // lock order: s.mu, then (inside Start) rf.mu
-	waiters map[int]chan result // log index -> client waiting for it
+	rf         *raft.Raft
+	db         *storage.DB
+	mu         sync.Mutex          // protects waiters; lock order: s.mu, then rf.mu
+	waiters    map[int]chan result // log index -> client waiting for it
+	maxRaftLog int                 // snapshot when Raft keeps more entries than this (0 = never)
+
+	// applyMu is held for every apply (including snapshots). Kill takes it too,
+	// so shutdown waits for an in-progress apply and nothing runs after it.
+	applyMu     sync.Mutex
+	dead        bool
+	lastApplied int
+
+	// Snapshot timing (protected by applyMu)
+	snapshots int
+	scanTime  time.Duration
+	saveTime  time.Duration
 }
 
 // NewServer applies every committed command from applyCh to db.
 // applyCh must be the same channel passed to raft.NewRaft.
-func NewServer(rf *raft.Raft, db *storage.DB, applyCh <-chan raft.ApplyMsg) *Server {
-	s := &Server{rf: rf, db: db, waiters: make(map[int]chan result)}
+func NewServer(rf *raft.Raft, db *storage.DB, applyCh <-chan raft.ApplyMsg, maxRaftLog int) *Server {
+	s := &Server{rf: rf, db: db, waiters: make(map[int]chan result), maxRaftLog: maxRaftLog}
 	go s.applyLoop(applyCh)
 	return s
 }
@@ -68,39 +128,98 @@ func (s *Server) IsLeader() bool {
 	return isLeader
 }
 
+// Kill stops Raft and waits for any in-progress apply to finish.
+// After it returns, the storage engine can be closed safely.
+func (s *Server) Kill() {
+	s.rf.Kill()
+	s.applyMu.Lock()
+	s.dead = true
+	s.applyMu.Unlock()
+}
+
+// SnapshotStats returns how many snapshots were taken and the total time
+// spent scanning the storage engine vs. saving the snapshot in Raft.
+func (s *Server) SnapshotStats() (int, time.Duration, time.Duration) {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+	return s.snapshots, s.scanTime, s.saveTime
+}
+
 func (s *Server) applyLoop(applyCh <-chan raft.ApplyMsg) {
 	for msg := range applyCh {
-		if msg.SnapshotValid {
-			continue // B2: restore the storage engine from the snapshot
+		s.applyMu.Lock()
+		if !s.dead {
+			s.apply(msg)
 		}
-
-		op, key, value := decodeCommand(msg.Command)
-
-		r := result{term: msg.Term}
-		switch op {
-		case opPut:
-			r.err = s.db.Put(key, value)
-		case opDelete:
-			r.err = s.db.Delete(key)
-		case opGet:
-			r.value, r.found, r.err = s.db.Get(key)
-		}
-
-		s.mu.Lock()
-		if ch, ok := s.waiters[msg.Index]; ok {
-			ch <- r // buffered, never blocks
-			delete(s.waiters, msg.Index)
-		}
-		s.mu.Unlock()
+		s.applyMu.Unlock()
+		// After Kill we keep draining applyCh so Raft's applier never blocks forever.
 	}
+}
+
+// apply runs with applyMu held.
+func (s *Server) apply(msg raft.ApplyMsg) {
+	if msg.SnapshotValid {
+		// From InstallSnapshot or a restart: replace the whole database.
+		if msg.SnapshotIndex <= s.lastApplied {
+			return
+		}
+		entries, err := decodeSnapshot(msg.Snapshot)
+		if err != nil {
+			panic(fmt.Sprintf("kv: %v", err))
+		}
+		if err := s.db.RestoreFrom(entries); err != nil {
+			panic(fmt.Sprintf("kv: restore snapshot: %v", err))
+		}
+		s.lastApplied = msg.SnapshotIndex
+		return
+	}
+	if msg.Index <= s.lastApplied {
+		return // already covered by a snapshot we restored
+	}
+
+	op, key, value := decodeCommand(msg.Command)
+	r := result{term: msg.Term}
+	switch op {
+	case opPut:
+		r.err = s.db.Put(key, value)
+	case opDelete:
+		r.err = s.db.Delete(key)
+	case opGet:
+		r.value, r.found, r.err = s.db.Get(key)
+	}
+	s.lastApplied = msg.Index
+
+	s.mu.Lock()
+	if ch, ok := s.waiters[msg.Index]; ok {
+		ch <- r // buffered, never blocks
+		delete(s.waiters, msg.Index)
+	}
+	s.mu.Unlock()
+
+	// Checkpoint: the DB now reflects exactly entries 1..msg.Index.
+	if s.maxRaftLog > 0 && s.rf.SnapshotReady(msg.Index, s.maxRaftLog) {
+		s.takeSnapshot(msg.Index)
+	}
+}
+
+func (s *Server) takeSnapshot(index int) {
+	start := time.Now()
+	entries, err := s.db.ScanAll()
+	if err != nil {
+		panic(fmt.Sprintf("kv: scan for snapshot: %v", err))
+	}
+	scanned := time.Now()
+	s.rf.Snapshot(index, encodeSnapshot(entries))
+
+	s.snapshots++
+	s.scanTime += scanned.Sub(start)
+	s.saveTime += time.Since(scanned)
 }
 
 func (s *Server) submit(op byte, key, value []byte) (result, error) {
 	cmd := encodeCommand(op, key, value)
 	ch := make(chan result, 1)
 
-	// Hold s.mu across Start + registration so the applier can't
-	// deliver this index before we're listening for it.
 	s.mu.Lock()
 	index, term, isLeader := s.rf.Start(cmd)
 	if !isLeader {
@@ -113,7 +232,7 @@ func (s *Server) submit(op byte, key, value []byte) (result, error) {
 	select {
 	case r := <-ch:
 		if r.term != term {
-			return result{}, ErrLostLeadership // a different entry won this index
+			return result{}, ErrLostLeadership
 		}
 		return r, r.err
 	case <-time.After(requestTimeout):
