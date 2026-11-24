@@ -3,8 +3,6 @@ package kv
 import (
 	"errors"
 	"fmt"
-	"github.com/Yashas2004/kvraft/raft"
-	"github.com/Yashas2004/kvraft/storage"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,6 +11,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Yashas2004/kvraft/raft"
+	"github.com/Yashas2004/kvraft/storage"
 )
 
 // startKVCluster returns the servers and each node's Raft directory.
@@ -226,7 +227,7 @@ func measureRestart(t *testing.T, raftDir string) restartCost {
 		t.Fatal(err)
 	}
 	if len(st.Snapshot) > 0 {
-		entries, err := decodeSnapshot(st.Snapshot)
+		entries, _, err := decodeSnapshot(st.Snapshot)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -238,7 +239,7 @@ func measureRestart(t *testing.T, raftDir string) restartCost {
 
 	start = time.Now()
 	for _, e := range st.Log[1:] {
-		op, key, value := decodeCommand(e.Command)
+		op, _, _, key, value := decodeCommand(e.Command)
 		if op == opPut {
 			db.Put(key, value)
 		} else if op == opDelete {
@@ -327,5 +328,58 @@ func TestReportSnapshots(t *testing.T) {
 			float64(cost.logBytes)/1024, float64(cost.snapBytes)/1024, cost.entries)
 		t.Logf("   restart: load %v + restore %v + replay %v = %v",
 			cost.load, cost.restore, cost.replay, cost.load+cost.restore+cost.replay)
+	}
+}
+
+// Five clients append numbered values while 30% of replies are "lost" AFTER
+// the command was applied, forcing retries. Every value must appear exactly
+// once, in order. Run with and without snapshots (dedup table must survive).
+func TestClerkExactlyOnce(t *testing.T) {
+	for _, maxRaftLog := range []int{0, 50} {
+		servers, _ := startKVCluster(t, 3, maxRaftLog)
+		waitForKVLeader(t, servers)
+		for _, s := range servers {
+			s.dropReplyProb = 0.3
+		}
+
+		clients := 5
+		appends := 50
+		var wg sync.WaitGroup
+		for c := 0; c < clients; c++ {
+			wg.Add(1)
+			go func(c int) {
+				defer wg.Done()
+				ck := NewClerk(servers)
+				key := []byte(fmt.Sprintf("k-%d", c))
+				for i := 0; i < appends; i++ {
+					if err := ck.Append(key, []byte(fmt.Sprintf("x%d;", i))); err != nil {
+						t.Errorf("client %d append %d: %v", c, i, err)
+						return
+					}
+				}
+			}(c)
+		}
+		wg.Wait()
+
+		for _, s := range servers {
+			s.dropReplyProb = 0
+		}
+		ck := NewClerk(servers)
+		for c := 0; c < clients; c++ {
+			expected := ""
+			for i := 0; i < appends; i++ {
+				expected += fmt.Sprintf("x%d;", i)
+			}
+			value, _, err := ck.Get([]byte(fmt.Sprintf("k-%d", c)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(value) != expected {
+				t.Fatalf("maxRaftLog=%d client %d: expected %d bytes, got %d:\n%s",
+					maxRaftLog, c, len(expected), len(value), value)
+			}
+		}
+		t.Logf("maxRaftLog=%d: %d clients x %d appends with 30%% lost replies, all applied exactly once",
+			maxRaftLog, clients, appends)
 	}
 }
