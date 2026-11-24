@@ -41,6 +41,7 @@ type LogEntry struct {
 // ApplyMsg is sent to the state machine for every committed entry, in index order.
 type ApplyMsg struct {
 	Index   int
+	Term    int
 	Command []byte
 }
 
@@ -267,7 +268,7 @@ func (rf *Raft) applier() {
 		var msgs []ApplyMsg
 		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
-			msgs = append(msgs, ApplyMsg{Index: rf.lastApplied, Command: rf.log[rf.lastApplied].Command})
+			msgs = append(msgs, ApplyMsg{Index: rf.lastApplied, Term: rf.log[rf.lastApplied].Term, Command: rf.log[rf.lastApplied].Command})
 		}
 
 		rf.mu.Unlock()
