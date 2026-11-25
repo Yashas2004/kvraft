@@ -295,6 +295,13 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.state == Leader
 }
 
+// Role returns the node's current state name (for logging).
+func (rf *Raft) Role() string {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state.String()
+}
+
 func (rf *Raft) LogLength() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()

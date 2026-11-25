@@ -78,10 +78,7 @@ func main() {
 		time.Sleep(100 * time.Millisecond)
 		term, isLeader := rf.GetState()
 		if term != lastTerm || isLeader != lastIsLeader {
-			role := "follower"
-			if isLeader {
-				role = "LEADER"
-			}
+			role := rf.Role()
 			log.Printf("term %d: %s", term, role)
 			lastTerm = term
 			lastIsLeader = isLeader

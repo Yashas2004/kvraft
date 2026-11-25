@@ -33,6 +33,9 @@ func main() {
 			break
 		}
 		fields := strings.Fields(scanner.Text())
+		for len(fields) > 0 && fields[0] == ">" {
+			fields = fields[1:] // ignore a pasted prompt
+		}
 		if len(fields) == 0 {
 			continue
 		}
