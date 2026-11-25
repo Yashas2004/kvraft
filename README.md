@@ -12,7 +12,7 @@ A distributed, linearizable key-value store in Go. Raft consensus is written fro
 ```mermaid
 flowchart TB
     C[Client / NetClerk<br/>clientID + seq, retries across servers] -->|TCP net/rpc| KV
-
+ 
     subgraph Node["Each node (one TCP port for KV + Raft RPCs)"]
         KV[KV server<br/>dedup table, waiters per log index]
         R[Raft<br/>elections, replication, commit]
@@ -23,7 +23,7 @@ flowchart TB
         R --> P
         KV -->|apply Put / Delete / Append / Get| DB
     end
-
+ 
     R <-->|AppendEntries / RequestVote / InstallSnapshot| Peers[Other nodes]
 ```
 
