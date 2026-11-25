@@ -308,12 +308,36 @@ func (rf *Raft) LogLength() int {
 	return len(rf.log) - 1
 }
 
-// SnapshotReady reports whether a snapshot at index would be accepted now:
-// the log is over maxLog entries and index is applied and durable locally.
+// DebugState returns internal indices for diagnosing stalls (bench/tests only).
+func (rf *Raft) DebugState() string {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	persisterBusy := false
+	if rf.persister != nil {
+		if rf.persister.mu.TryLock() {
+			rf.persister.mu.Unlock()
+		} else {
+			persisterBusy = true
+		}
+	}
+	leaderInfo := ""
+	if rf.state == Leader {
+		leaderInfo = fmt.Sprintf(" match=%v next=%v", rf.matchIndex, rf.nextIndex)
+	}
+	return fmt.Sprintf("%s term=%d last=%d persisted=%d commit=%d applied=%d snap=%d persisterBusy=%v%s",
+		rf.state, rf.currentTerm, rf.lastIndex(), rf.persistedIndex, rf.commitIndex,
+		rf.lastApplied, rf.lastIncludedIndex, persisterBusy, leaderInfo)
+}
+
+// SnapshotReady reports whether a snapshot at index would be worth taking now:
+// it would compact more than maxLog entries, and index is applied and durable locally.
+// Counting only compactable entries (index - lastIncludedIndex), not the whole log,
+// matters: if unapplied entries alone exceeded maxLog, a whole-log trigger would
+// fire on every apply, each snapshot trimming one entry (a snapshot storm).
 func (rf *Raft) SnapshotReady(index, maxLog int) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return len(rf.log)-1 > maxLog && index > rf.lastIncludedIndex &&
+	return index-rf.lastIncludedIndex > maxLog &&
 		index <= rf.lastApplied && index <= rf.persistedIndex
 }
 
