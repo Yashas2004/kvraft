@@ -179,7 +179,17 @@ func (s *Server) IsLeader() bool {
 func (s *Server) Kill() {
 	s.killed.Store(true) // new requests are rejected right away
 	s.rf.Kill()          // stop Raft (also joins its snapshot saver)
-	s.applyMu.Lock()     // wait for any in-progress apply to finish
+
+	// Requests already waiting will never be applied by this server.
+	// Fail them now so their clients retry elsewhere instead of waiting out requestTimeout.
+	s.mu.Lock()
+	for index, ch := range s.waiters {
+		ch <- result{term: -1} // term mismatch -> submit returns ErrLostLeadership
+		delete(s.waiters, index)
+	}
+	s.mu.Unlock()
+
+	s.applyMu.Lock() // wait for any in-progress apply to finish
 	s.dead = true
 	s.applyMu.Unlock()
 }
@@ -287,6 +297,10 @@ func (s *Server) submit(op byte, clientID, seq int64, key, value []byte) (result
 	ch := make(chan result, 1)
 
 	s.mu.Lock()
+	if s.killed.Load() { // Kill may have drained waiters between our first check and here
+		s.mu.Unlock()
+		return result{}, ErrWrongLeader
+	}
 	index, term, isLeader := s.rf.Start(cmd)
 	if !isLeader {
 		s.mu.Unlock()
