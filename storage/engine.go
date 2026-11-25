@@ -344,7 +344,7 @@ func (db *DB) levelLimit(level int) int64 {
 // then deletes the inputs. The output is always written, even if empty, so the
 // numbering rule can identify leftover inputs after a crash.
 func (db *DB) compactInto(inputs []*tableFile, outputLevel int) (*tableFile, error) {
-	var iterators []*sstIterator
+	var iterators []entryIterator
 	for _, in := range inputs {
 		iterators = append(iterators, in.table.newIterator())
 	}
@@ -494,4 +494,68 @@ func (db *DB) Close() error {
 	err := db.wal.Close()
 	db.closeTables()
 	return err
+}
+
+// ScanAll returns every live key/value in key order (tombstones removed).
+// Used to build a Raft snapshot. No flush: the memtable is merged in as
+// the newest sorted run, so the scan touches no files and needs only a read lock.
+func (db *DB) ScanAll() ([]Entry, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	iterators := []entryIterator{&sliceIterator{entries: db.mem.Entries()}} // newest
+	for _, tf := range db.l0 {
+		iterators = append(iterators, tf.table.newIterator())
+	}
+	for level := 1; level < numLevels; level++ {
+		if db.levels[level] != nil {
+			iterators = append(iterators, db.levels[level].table.newIterator())
+		}
+	}
+	return mergeTables(iterators, true)
+}
+
+// RestoreFrom replaces the entire database with entries (sorted, unique,
+// as produced by ScanAll). The new table is written first, at the deepest
+// level with the highest file number, so a crash midway leaves every older
+// file obsolete by the numbering rule.
+func (db *DB) RestoreFrom(entries []Entry) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	var newTable *tableFile
+	if len(entries) > 0 {
+		tf, err := db.writeTableFile(numLevels-1, entries)
+		if err != nil {
+			return err
+		}
+		newTable = tf
+	}
+
+	for _, tf := range db.l0 {
+		db.deleteTableFile(tf)
+	}
+	db.l0 = nil
+	for level := 1; level < numLevels; level++ {
+		if db.levels[level] != nil {
+			db.deleteTableFile(db.levels[level])
+			db.levels[level] = nil
+		}
+	}
+	db.levels[numLevels-1] = newTable
+
+	// Fresh WAL and memtable: nothing older than the snapshot survives.
+	if err := db.wal.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(db.walPath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	wal, _, err := OpenWAL(db.walPath(), db.opts.SyncEachWrite)
+	if err != nil {
+		return err
+	}
+	db.wal = wal
+	db.mem = NewMemtable()
+	return nil
 }

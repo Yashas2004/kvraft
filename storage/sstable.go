@@ -279,3 +279,6 @@ func (it *sstIterator) Next() bool {
 	}
 	return true
 }
+
+func (it *sstIterator) Current() Entry { return it.current }
+func (it *sstIterator) Err() error     { return it.err }

@@ -56,7 +56,7 @@ func TestMergeNewestWins(t *testing.T) {
 	}
 
 	for _, dropTombstones := range []bool{false, true} {
-		var iterators []*sstIterator
+		var iterators []entryIterator
 		for _, table := range tables {
 			iterators = append(iterators, table.newIterator())
 		}

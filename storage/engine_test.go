@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"os"
@@ -307,4 +308,81 @@ func TestReportAmplification(t *testing.T) {
 			stats.WriteAmplification(), lsmWA, spaceAmp, absentLatency)
 		db.Close()
 	}
+}
+
+func TestScanAllAndRestore(t *testing.T) {
+	opts := Options{MemtableSizeLimit: 1024}
+	db, err := OpenDBWithOptions(t.TempDir(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := make(map[string]string)
+	for i := 0; i < 500; i++ {
+		key := fmt.Sprintf("key%04d", i%200)
+		value := fmt.Sprintf("v%d", i)
+		db.Put([]byte(key), []byte(value))
+		expected[key] = value
+	}
+	for i := 0; i < 200; i += 3 {
+		key := fmt.Sprintf("key%04d", i)
+		db.Delete([]byte(key))
+		delete(expected, key)
+	}
+
+	entries, err := db.ScanAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != len(expected) {
+		t.Fatalf("ScanAll returned %d entries, expected %d", len(entries), len(expected))
+	}
+	for i, e := range entries {
+		want, ok := expected[string(e.Key)]
+		if !ok || want != string(e.Value) || e.Deleted {
+			t.Fatalf("ScanAll entry %s=%q is wrong", e.Key, e.Value)
+		}
+		if i > 0 && bytes.Compare(entries[i-1].Key, e.Key) >= 0 {
+			t.Fatalf("ScanAll not sorted at %d", i)
+		}
+	}
+	db.Close()
+
+	// Restore into a DB that already holds unrelated data: it must be replaced.
+	dir2 := t.TempDir()
+	db2, err := OpenDBWithOptions(dir2, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db2.Put([]byte("stale"), []byte("x"))
+	if err := db2.RestoreFrom(entries); err != nil {
+		t.Fatal(err)
+	}
+
+	check := func(d *DB) {
+		for key, want := range expected {
+			value, found, _ := d.Get([]byte(key))
+			if !found || string(value) != want {
+				t.Fatalf("%s: expected %s, got %q", key, want, value)
+			}
+		}
+		for i := 0; i < 200; i += 3 {
+			if _, found, _ := d.Get([]byte(fmt.Sprintf("key%04d", i))); found {
+				t.Fatalf("deleted key%04d came back", i)
+			}
+		}
+		if _, found, _ := d.Get([]byte("stale")); found {
+			t.Fatalf("pre-restore data survived RestoreFrom")
+		}
+	}
+
+	check(db2)
+	db2.Close()
+
+	db3, err := OpenDBWithOptions(dir2, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db3.Close()
+	check(db3)
 }
