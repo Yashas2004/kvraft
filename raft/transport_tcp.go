@@ -41,11 +41,16 @@ func (s *RaftService) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSn
 	return nil
 }
 
-// Serve accepts RPC connections on ln in the background.
-// Each connection gets its own goroutine; Accept returns once ln is closed.
+// RegisterRPC adds the Raft service to an existing RPC server, so one port
+// can serve both Raft peers and KV clients.
+func RegisterRPC(server *rpc.Server, rf *Raft) error {
+	return server.RegisterName("Raft", &RaftService{rf: rf})
+}
+
+// Serve is the Raft-only convenience version: its own RPC server on ln.
 func Serve(rf *Raft, ln net.Listener) error {
 	server := rpc.NewServer()
-	if err := server.RegisterName("Raft", &RaftService{rf: rf}); err != nil {
+	if err := RegisterRPC(server, rf); err != nil {
 		return err
 	}
 	go server.Accept(ln)

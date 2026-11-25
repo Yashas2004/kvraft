@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/rpc"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,8 +17,8 @@ import (
 	"github.com/Yashas2004/kvraft/storage"
 )
 
-// startKVCluster returns the servers and each node's Raft directory.
-func startKVCluster(t *testing.T, n, maxRaftLog int) ([]*Server, []string) {
+// startKVCluster returns the servers, each node's Raft directory, and the addresses.
+func startKVCluster(t *testing.T, n, maxRaftLog int) ([]*Server, []string, []string) {
 	listeners := make([]net.Listener, n)
 	addrs := make([]string, n)
 	for i := 0; i < n; i++ {
@@ -41,14 +42,21 @@ func startKVCluster(t *testing.T, n, maxRaftLog int) ([]*Server, []string) {
 		}
 		persisters[i] = persister
 		rf := raft.NewRaft(i, n, raft.NewTCPTransport(addrs), applyCh, persister)
-		if err := raft.Serve(rf, listeners[i]); err != nil {
-			t.Fatal(err)
-		}
 		db, err := storage.OpenDB(t.TempDir(), false)
 		if err != nil {
 			t.Fatal(err)
 		}
 		servers[i] = NewServer(rf, db, applyCh, maxRaftLog)
+
+		// One port for both Raft and KV, exactly like cmd/server.
+		rpcServer := rpc.NewServer()
+		if err := raft.RegisterRPC(rpcServer, rf); err != nil {
+			t.Fatal(err)
+		}
+		if err := RegisterRPC(rpcServer, servers[i]); err != nil {
+			t.Fatal(err)
+		}
+		go rpcServer.Accept(listeners[i])
 	}
 
 	t.Cleanup(func() {
@@ -62,7 +70,7 @@ func startKVCluster(t *testing.T, n, maxRaftLog int) ([]*Server, []string) {
 			persisters[i].Close()
 		}
 	})
-	return servers, raftDirs
+	return servers, raftDirs, addrs
 }
 
 func waitForKVLeader(t *testing.T, servers []*Server) int {
@@ -92,7 +100,7 @@ func do(t *testing.T, servers []*Server, op func(s *Server) error) {
 }
 
 func TestKVBasic(t *testing.T) {
-	servers, _ := startKVCluster(t, 3, 2) // tiny limit: every node snapshots constantly
+	servers, _, _ := startKVCluster(t, 3, 2) // tiny limit: every node snapshots constantly
 	waitForKVLeader(t, servers)
 
 	do(t, servers, func(s *Server) error { return s.Put([]byte("a"), []byte("1")) })
@@ -142,7 +150,7 @@ func TestReportReplication(t *testing.T) {
 		t.Skip("slow measurement")
 	}
 
-	servers, _ := startKVCluster(t, 3, 0)
+	servers, _, _ := startKVCluster(t, 3, 0)
 	leader := waitForKVLeader(t, servers)
 	value := make([]byte, 100)
 	duration := 2 * time.Second
@@ -263,7 +271,7 @@ func TestReportSnapshots(t *testing.T) {
 	value := make([]byte, 100)
 
 	for _, maxRaftLog := range []int{0, 1000, 5000, 10000} {
-		servers, raftDirs := startKVCluster(t, 3, maxRaftLog)
+		servers, raftDirs, _ := startKVCluster(t, 3, maxRaftLog)
 		var leader atomic.Int64
 		leader.Store(int64(waitForKVLeader(t, servers)))
 		var retries atomic.Int64
@@ -336,7 +344,7 @@ func TestReportSnapshots(t *testing.T) {
 // once, in order. Run with and without snapshots (dedup table must survive).
 func TestClerkExactlyOnce(t *testing.T) {
 	for _, maxRaftLog := range []int{0, 50} {
-		servers, _ := startKVCluster(t, 3, maxRaftLog)
+		servers, _, _ := startKVCluster(t, 3, maxRaftLog)
 		waitForKVLeader(t, servers)
 		for _, s := range servers {
 			s.dropReplyProb = 0.3
@@ -381,5 +389,38 @@ func TestClerkExactlyOnce(t *testing.T) {
 		}
 		t.Logf("maxRaftLog=%d: %d clients x %d appends with 30%% lost replies, all applied exactly once",
 			maxRaftLog, clients, appends)
+	}
+}
+
+// A real TCP client against a real 3-node cluster: write, kill the leader,
+// then keep reading and writing through the failover.
+func TestNetClerkFailover(t *testing.T) {
+	servers, _, addrs := startKVCluster(t, 3, 0)
+	leader := waitForKVLeader(t, servers)
+
+	ck := NewNetClerk(addrs)
+	defer ck.Close()
+
+	if err := ck.Put([]byte("k"), []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ck.Append([]byte("k"), []byte(";v2")); err != nil {
+		t.Fatal(err)
+	}
+
+	servers[leader].Kill() // the leader dies; its RPCs now fail
+	start := time.Now()
+	value, found, err := ck.Get([]byte("k"))
+	if err != nil || !found || string(value) != "v1;v2" {
+		t.Fatalf("after leader death: got %q found=%v err=%v", value, found, err)
+	}
+	t.Logf("first request after killing the leader took %v (election + client retry)", time.Since(start))
+
+	if err := ck.Append([]byte("k"), []byte(";v3")); err != nil {
+		t.Fatal(err)
+	}
+	value, _, _ = ck.Get([]byte("k"))
+	if string(value) != "v1;v2;v3" {
+		t.Fatalf("expected v1;v2;v3, got %q", value)
 	}
 }
